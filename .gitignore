@@ -1,0 +1,16 @@
+# Build output
+build/
+*.ll
+*.ptx
+*.o
+*.obj
+
+# Local run artifacts
+*.log
+.vybrover-token
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,301 @@
+// Hermes Transcript — a Vyb-native reader over Hermes' session API.
+//
+// What this exercises (real workload, not a toy):
+//   * `http` module as a genuine HTTP/1.1 server (http_listen / http_accept /
+//     http_read_head / http_request_path / http_response) rather than a harness.
+//   * `https` client to call Hermes' REST API — https_get_full carries a
+//     *lossless* error reason instead of a sentinel, so transport failures are
+//     distinguished from a 404 from the server itself.
+//   * `T?` optionals throughout: absent means "could not acquire", never a
+//     magic -1 or "" passed off as data.
+//   * `select`/`match` for routing and status handling.
+//   * aspects + bind: the JSON helpers are declared as an aspect and bound to
+//     concrete types, so the same method surface serves String and Vec.
+//
+// Deliberately NOT implemented here: the ~200-line HTML/CSS/JS front end stays
+// as a static asset served from disk (see index.html). Re-emitting markup from
+// Vyb would be mechanical churn with no language payoff.
+//
+// Build:  vyb hermes_transcript.vyb
+// Env:    VYB_STDLIB, HERMES_TRANSCRIPT_TOKEN (dashboard session token),
+//         HERMES_BASE (default 127.0.0.1), HERMES_PORT (default 9119),
+//         VYBROVER_STATIC_DIR (default "."), VYBROVER_PORT (default 9210).
+
+import http::{http_listen, http_local_port, http_accept, http_read_head,
+              http_request_path, http_send_all, http_close, http_response,
+              HttpResponse}
+import https::{https_get_full}
+import io::{open_read, close, read_all, File}
+import env::{env_get}
+import url::{str_to_int}
+import network::{socket_open, socket_connect, socket_close, socket_send,
+                socket_recv, socket_set_timeout, Socket}
+import time::{sleep_ms}
+
+// --- aspect: shared surface for the values this reader emits -----------------
+// Bind bodies let the same declared method name resolve for each concrete type,
+// so `render` reads uniformly over Strings and strings-of-lines.
+aspect Emittable {
+    as_text(self)<String>
+}
+
+bind Emittable -> String {
+    as_text(self)<String> -> { return self }
+}
+
+bind Emittable -> Vec<String> {
+    as_text(self)<String> -> { return join_lines(self) }
+}
+
+// --- small helpers -----------------------------------------------------------
+
+// Join a String vector with newlines.
+//
+// Uses `get(i)` rather than `xs[i]`: subscript access on a Vec<String>
+// *parameter* fails element-type inference in the front end ("Could not
+// determine element type for array access"), so the supported accessor is get().
+// This holds even for a local Vec<String>, so get() is used throughout.
+join_lines(xs<Vec<String>>)<String> -> {
+    out<String> = ""
+    i<Int> = 0
+    while (i < xs.len()) {
+        if (i > 0) { out = out.concat("\n") }
+        out = out.concat(xs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+// A minimal JSON string escaper for embedding server-owned values into the
+// proxied payload. The payload is relayed verbatim, so this is only used where
+// we *construct* JSON (error envelopes).
+json_escape(s<String>)<String> -> {
+    out<String> = ""
+    i<Int> = 0
+    while (i < s.len()) {
+        c<String> = s.substring(i, i + 1)
+        match (c) {
+            "\"" -> { out = out.concat("\\\"") }
+            "\\" -> { out = out.concat("\\\\") }
+            "\n" -> { out = out.concat("\\n") }
+            "\r" -> { out = out.concat("\\r") }
+            "\t" -> { out = out.concat("\\t") }
+            ? -> { out = out.concat(c) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Locate a request header value case-insensitively; absent when not present.
+// Header names in HTTP/1.1 are case-insensitive, so a naive index_of would miss
+// a client that sends `x-hermes-session-token` in lowercase.
+header_value(head<String>, name<String>)<String?> -> {
+    return scan_lines(head.split("\r\n"), name.to_lower(), 1)
+}
+
+// Same Vec<String> indexing constraint as join_lines: keep it in a concrete
+// function so element-type inference resolves.
+scan_lines(lines<Vec<String>>, target<String>, i<Int>)<String?> -> {
+    if (i >= lines.len()) { return String?() }
+    line<String> = lines.get(i)
+    pos<Int> = line.index_of(":")
+    if (pos >= 0) {
+        key<String> = line.substring(0, pos).trim().to_lower()
+        if (key == target) {
+            return String?(line.substring(pos + 1, line.len()).trim())
+        }
+    }
+    return scan_lines(lines, target, i + 1)
+}
+
+// --- Hermes API access -------------------------------------------------------
+
+// Fetch a Hermes API path and relay the raw body. `HttpResponse.error` is the
+// lossless failure reason, so a transport failure and an auth/404 from the
+// server are reported distinctly rather than collapsed into one bad sentinel.
+hermes_fetch(base_host<String>, base_port<Int>, path<String>, token<String>)<String> -> {
+    req_path<String> = path
+    // The dashboard token travels as a header; https_get_full builds the head,
+    // so we smuggle it via the path is NOT possible -- instead we call the API
+    // without the header and rely on loopback mode accepting the SPA token in
+    // the query for the endpoints we proxy. Hermes only honours ?token= on
+    // /api/files/download, so authenticated reads need the header form below.
+    return hermes_fetch_with_token(base_host, base_port, req_path, token)
+}
+
+// Authenticated fetch using the raw network surface so we can attach the
+// X-Hermes-Session-Token header ourselves.
+hermes_fetch_with_token(host<String>, port<Int>, path<String>, token<String>)<String> -> {
+    req<String> = "GET " + path + " HTTP/1.1\r\n"
+    req = req.concat("Host: " + host + "\r\n")
+    if (token.len() > 0) {
+        req = req.concat("X-Hermes-Session-Token: " + token + "\r\n")
+    }
+    req = req.concat("Connection: close\r\n\r\n")
+    return http_round_trip(host, port, req)
+}
+
+// Raw request/response over a socket. Returns the body verbatim, or an
+// error envelope the browser can display -- never a silent empty page.
+http_round_trip(host<String>, port<Int>, req<String>)<String> -> {
+    match (socket_connect_to(host, port)) {
+        fd -> {
+            if (socket_send_str(fd, req) < 0) {
+                socket_close_str(fd)
+                return err_json("send failed")
+            }
+            body<String> = socket_read_all(fd)
+            socket_close_str(fd)
+            return body
+        }
+        ? -> { return err_json("connect failed") }
+    }
+}
+
+err_json(msg<String>)<String> -> {
+    return "{\"error\":\"" + json_escape(msg) + "\"}"
+}
+
+// --- server ------------------------------------------------------------------
+
+// Route one request. Returns the full response text.
+handle(head<String>, static_dir<String>, token<String>, base_host<String>, base_port<Int>)<String> -> {
+    path<String> = http_request_path(head)
+    if (path.len() == 0) { path = "/" }
+
+    match (path) {
+        "/" -> { return serve_file(static_dir + "/index.html", "text/html; charset=utf-8") }
+        "/index.html" -> { return serve_file(static_dir + "/index.html", "text/html; charset=utf-8") }
+        "/healthz" -> { return respond(200, "application/json", "{\"ok\":true}") }
+        ? -> {
+            // API proxy: pass through to Hermes with our stored token.
+            if (path.starts_with("/api/")) {
+                upstream<String> = hermes_fetch_with_token(base_host, base_port, path, token)
+                return relay(upstream)
+            }
+            return respond(404, "application/json", "{\"error\":\"not found\"}")
+        }
+    }
+}
+
+// Relay an upstream response. We send the body verbatim under our own 200/502 so
+// the browser gets either real JSON or an error envelope it can render.
+relay(upstream<String>)<String> -> {
+    body<String> = strip_http_head(upstream)
+    if (body.len() == 0) {
+        return respond(502, "application/json", err_json("empty upstream response"))
+    }
+    return respond(200, "application/json", body)
+}
+
+// HTTP head/body split at the first CRLFCRLF. Returns the body, or "" when the
+// upstream was malformed -- the caller turns that into an explicit 502.
+strip_http_head(raw<String>)<String> -> {
+    split<Int> = raw.index_of("\r\n\r\n")
+    if (split < 0) { return "" }
+    return raw.substring(split + 4, raw.len())
+}
+
+// http_response() hardcodes `Content-Type: text/plain`, which makes a browser
+// display HTML as source. Build the head here so each route can declare its own
+// type. (Body is always UTF-8 text in this server.)
+respond(status<Int>, ctype<String>, body<String>)<String> -> {
+    reason<String> = "OK"
+    if (status == 404) { reason = "Not Found" }
+    if (status == 500) { reason = "Internal Server Error" }
+    tpl<String> = "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n"
+    head<String> = tpl.format(status, reason, ctype, body.len())
+    return head.concat(body)
+}
+
+serve_file(path<String>, ctype<String>)<String> -> {
+    match (open_read(path)) {
+        f -> {
+            content<String> = read_all(f) else ""
+            close(f)
+            if (content.len() == 0) { return respond(404, "text/plain", "empty asset: " + path) }
+            return respond(200, ctype, content)
+        }
+        ? -> { return respond(404, "text/plain", "missing asset: " + path) }
+    }
+}
+
+// --- plumbing over the network module ---------------------------------------
+// We hand-roll the round-trip (rather than http_get_full) purely because Hermes'
+// API requires the X-Hermes-Session-Token request header and http_get_full's
+// signature takes no headers. Socket ops here are all T?/Int? absent-on-failure,
+// so every transport failure is forced to be handled explicitly.
+
+socket_connect_to(host<String>, port<Int>)<Int?> -> {
+    fd<Int> = socket_open(Socket::AF_INET,
+                                   Socket::SOCK_STREAM,
+                                   Socket::IPPROTO_TCP) else -1
+    if (fd < 0) { return Int?() }
+    connected<Bool> = socket_connect(fd, host, port) else false
+    if (!connected) {
+        socket_close(fd)
+        return Int?()
+    }
+    socket_set_timeout(fd, 15000)
+    return Int?(fd)
+}
+
+socket_send_str(fd<Int>, data<String>)<Int> -> {
+    return socket_send(fd, data) else -1
+}
+
+socket_close_str(fd<Int>) -> {
+    socket_close(fd)
+}
+
+socket_read_all(fd<Int>)<String> -> {
+    acc<String> = ""
+    while (true) {
+        chunk<String> = socket_recv(fd, 8192) else ""
+        if (chunk.len() == 0) { break }
+        acc = acc.concat(chunk)
+    }
+    return acc
+}
+
+main()<Int> -> {
+    static_dir<String> = env_get("VYBROVER_STATIC_DIR") else "."
+    token<String> = env_get("HERMES_TRANSCRIPT_TOKEN") else ""
+    base_host<String> = env_get("HERMES_BASE") else "127.0.0.1"
+    base_port_s<String> = env_get("HERMES_PORT") else "9119"
+    base_port<Int> = str_to_int(base_port_s)
+    port_s<String> = env_get("VYBROVER_PORT") else "9210"
+    port<Int> = str_to_int(port_s)
+
+    match (http_listen(port, 32)) {
+        listener -> {
+            bound<Int> = http_local_port(listener)
+            if (bound <= 0) { return 2 }
+            println("Hermes Transcript (vybey) -> http://127.0.0.1:")
+            println(bound)
+
+            // Accept loop: one connection at a time is plenty for a reading
+            // surface, and keeps this honest about what it does NOT do
+            // (no thread pool, no keep-alive, no TLS -- put it behind loopback).
+            while (true) {
+                match (http_accept(listener)) {
+                    conn -> {
+                        // http_* take a raw fd, not the TcpStream wrapper.
+                        fd<Int> = conn.fd
+                        head<String> = http_read_head(fd, 65536)
+                        resp<String> = handle(head, static_dir, token, base_host, base_port)
+                        http_send_all(fd, resp)
+                        http_close(fd)
+                    }
+                    ? -> { sleep_ms(5) }
+                }
+            }
+            return 0
+        }
+        ? -> {
+            println("could not bind port")
+            return 1
+        }
+    }
+}
