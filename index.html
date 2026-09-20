@@ -43,6 +43,51 @@
   }
   .search:focus{border-color:color-mix(in srgb,#ffe6cb 35%,transparent)}
   .side-list{overflow-y:auto; flex:1; min-height:0}
+  .side-foot{
+    padding:10px 14px; border-top:1px solid var(--border);
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+  }
+  .count{font-size:11px; color:var(--text-secondary); font-family:var(--font-mono)}
+
+  /* ---- shared controls ---- */
+  .btn{
+    padding:5px 10px; font:12px var(--font-sans); color:var(--text-secondary);
+    background:var(--card); border:1px solid var(--border);
+    border-radius:var(--radius); cursor:pointer; white-space:nowrap;
+  }
+  .btn:hover{color:var(--midground); background:var(--card-hi)}
+  .btn:active{transform:translateY(1px)}
+  .toolbar{
+    padding:8px 22px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  .toolbar .spacer{flex:1}
+  .seg{display:flex; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden}
+  .seg-btn{
+    padding:5px 11px; font:12px var(--font-sans); color:var(--text-secondary);
+    background:transparent; border:none; border-right:1px solid var(--border); cursor:pointer;
+  }
+  .seg-btn:last-child{border-right:none}
+  .seg-btn:hover{background:var(--card)}
+  .seg-btn.active{background:var(--card-hi); color:var(--midground); font-weight:600}
+  .chk{
+    display:flex; align-items:center; gap:6px; font-size:12px;
+    color:var(--text-secondary); cursor:pointer; user-select:none;
+  }
+  .chk input{accent-color:var(--success); cursor:pointer}
+  .jump-wrap{position:relative}
+  .float{
+    position:absolute; right:22px; bottom:16px; z-index:5;
+    box-shadow:0 4px 14px color-mix(in srgb,#000 55%,transparent);
+  }
+  .copy{
+    margin-left:auto; padding:2px 8px; font-size:11px;
+    color:var(--text-secondary); background:transparent;
+    border:1px solid var(--border); border-radius:var(--radius); cursor:pointer;
+  }
+  .copy:hover{color:var(--midground); background:var(--card)}
+  .copy.done{color:var(--success); border-color:color-mix(in srgb,var(--success) 50%,transparent)}
+  .hidden{display:none !important}
   .sess{
     padding:10px 14px; border-bottom:1px solid color-mix(in srgb,#ffe6cb 8%,transparent);
     cursor:pointer;
@@ -151,14 +196,34 @@
       <input id="q" class="search" placeholder="Search sessions…" autocomplete="off">
     </div>
     <div id="list" class="side-list"><div class="spin">Loading sessions…</div></div>
+    <div class="side-foot">
+      <button id="refresh" class="btn" title="Re-fetch the session list (r)">↻ Refresh</button>
+      <span id="count" class="count"></span>
+    </div>
   </aside>
   <main class="main">
     <div class="main-head">
       <div class="main-title" id="title">Select a session</div>
       <div class="main-sub" id="sub"></div>
     </div>
+    <div class="toolbar">
+      <div class="seg" id="roleFilter">
+        <button class="seg-btn active" data-role="all">All</button>
+        <button class="seg-btn" data-role="user">User</button>
+        <button class="seg-btn" data-role="assistant">Assistant</button>
+        <button class="seg-btn" data-role="tool">Tools</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="onlyTools"> tools only</label>
+      <div class="spacer"></div>
+      <button id="expandAll" class="btn" title="Expand every tool call">⌄ Expand all</button>
+      <button id="collapseAll" class="btn" title="Collapse every tool call">⌃ Collapse all</button>
+      <button id="toBottom" class="btn" title="Jump to newest message (b)">⤓ Bottom</button>
+    </div>
     <div class="scroll" id="scroll">
       <div class="empty">Pick a session on the left to read its transcript.</div>
+    </div>
+    <div class="jump-wrap">
+      <button id="toTop" class="btn float" title="Jump to oldest message (t)">⤒ Top</button>
     </div>
   </main>
 </div>
@@ -211,15 +276,17 @@ const shortId = id => id.replace(/^(\d{8})_(\d{6})_.*$/,'$1 $2');
 
 let current = null;
 let sessions = [];
+let lastMsgs = [];      // the rendered session's raw messages, for re-filtering
 
 async function loadSessions(){
   const j = await api('/api/sessions', {limit:100, order:'recent'});
   sessions = j.sessions || [];
-  renderList(sessions);
+  renderList(sessions.filter(matches));
+  $('#count').textContent = sessions.length + ' sessions';
 }
 function renderList(items){
   const el = $('#list');
-  if(!items.length){ el.innerHTML = '<div class="spin">No sessions.</div>'; return; }
+  if(!items.length){ el.innerHTML = '<div class="spin">No sessions match.</div>'; return; }
   el.innerHTML = items.map(s=>`
     <div class="sess ${s.id===current?'active':''}" data-id="${s.id}">
       <div class="sess-title">${esc(s.display_name || shortId(s.id))}</div>
@@ -236,10 +303,30 @@ async function openSession(id){
   $('#sub').textContent = id;
   const j = await api(`/api/sessions/${encodeURIComponent(id)}/messages`, {limit:100, order:'oldest'});
   if(j.error){ scroll.innerHTML = `<div class="err">${esc(j.error)}</div>`; return; }
-  const msgs = j.messages || [];
+  lastMsgs = j.messages || [];
+  paint();
+  $('#toBottom').click();     // land on the newest message
+}
+
+/* ---- filtering: role segment + tools-only checkbox ---- */
+let roleFilter = 'all';
+
+function visible(msgs){
+  const onlyTools = $('#onlyTools').checked;
+  let out = msgs;
+  if(onlyTools) return out.filter(m=>m.role==='tool');
+  if(roleFilter==='user')      return out.filter(m=>m.role==='user');
+  if(roleFilter==='assistant') return out.filter(m=>m.role==='assistant');
+  if(roleFilter==='tool')      return out.filter(m=>m.role==='tool');
+  return out;
+}
+
+function paint(){
+  const scroll = $('#scroll');
+  const msgs = visible(lastMsgs);
   scroll.innerHTML = `<div class="wrap">${render(msgs)}</div>`;
   wireTools();
-  scroll.scrollTop = scroll.scrollHeight;
+  wireCopy();
 }
 
 function render(msgs){
@@ -257,12 +344,13 @@ function render(msgs){
     const who = m.role==='user' ? 'user' : 'assistant';
     html += `<div class="turn ${who}">
       <div class="turn-head"><span class="who ${who}">${who}</span>
-      <span class="when">${fmtTime(m.timestamp)}</span></div>
+      <span class="when">${fmtTime(m.timestamp)}</span>
+      <button class="copy" data-copy="${esc(text)}" title="Copy message">Copy</button></div>
       <div class="bubble">${md(text)}</div>
     </div>`;
   }
   flushTools();
-  return html || '<div class="empty">This session has no renderable messages.</div>';
+  return html || '<div class="spin">Nothing matches this filter.</div>';
 }
 
 function toolBlock(m){
@@ -272,20 +360,84 @@ function toolBlock(m){
   return `<div class="tool">
     <div class="tool-head"><span class="tool-name">${esc(name)}</span>
       <span style="color:var(--text-secondary)">${esc(preview)}${body.length>90?'…':''}</span>
+      <button class="copy" data-copy="${esc(body)}" title="Copy tool payload">Copy</button>
       <span class="tool-chev">▸</span></div>
     <div class="tool-body"><pre>${esc(body)}</pre></div>
   </div>`;
 }
 function wireTools(){
   document.querySelectorAll('.tool-head').forEach(h=>{
-    h.onclick=()=>{
+    h.onclick=e=>{
+      if(e.target.classList.contains('copy')) return;   // Copy is inside the head
       const t=h.parentElement; t.classList.toggle('open');
       h.querySelector('.tool-chev').textContent = t.classList.contains('open')?'▾':'▸';
     };
   });
 }
 
-/* ---- search ---- */
+/* ---- copy buttons ---- */
+// Copies via the async Clipboard API (works on http://127.0.0.1, a secure
+// context). If the browser denies the permission, fall back to a hidden
+// textarea + execCommand so the click still does something useful.
+function copyText(text, btn){
+  const done = ()=>{ btn.textContent='Copied'; btn.classList.add('done');
+                     setTimeout(()=>{ btn.textContent='Copy'; btn.classList.remove('done'); },1100); };
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(text).then(done).catch(()=>legacyCopy(text, done, btn));
+  } else {
+    legacyCopy(text, done, btn);
+  }
+}
+function legacyCopy(text, done, btn){
+  const ta=document.createElement('textarea');
+  ta.value=text; ta.setAttribute('readonly','');
+  ta.style.position='fixed'; ta.style.left='-9999px'; ta.style.top='0';
+  document.body.appendChild(ta);
+  ta.select(); ta.setSelectionRange(0, text.length);
+  let ok=false;
+  try { ok=document.execCommand('copy'); } catch(e){ ok=false; }
+  document.body.removeChild(ta);
+  if(ok) done();
+  else { btn.textContent='Select'; btn.title='Copy blocked — text selected, press ⌘C';
+         const r=document.createRange(); r.selectNodeContents(btn.parentElement.nextElementSibling || btn.parentElement);
+         const s=getSelection(); s.removeAllRanges(); s.addRange(r); }
+}
+function wireCopy(){
+  document.querySelectorAll('.copy').forEach(b=>{
+    b.onclick=e=>{
+      e.stopPropagation();
+      copyText(b.dataset.copy || '', b);
+    };
+  });
+}
+
+/* ---- toolbar ---- */
+$('#refresh').onclick = ()=>{ loadSessions().catch(e=>alert('Refresh failed: '+e.message)); };
+$('#expandAll').onclick = ()=>{
+  document.querySelectorAll('.tool').forEach(t=>{
+    t.classList.add('open');
+    const c=t.querySelector('.tool-chev'); if(c) c.textContent='▾';
+  });
+};
+$('#collapseAll').onclick = ()=>{
+  document.querySelectorAll('.tool').forEach(t=>{
+    t.classList.remove('open');
+    const c=t.querySelector('.tool-chev'); if(c) c.textContent='▸';
+  });
+};
+$('#toBottom').onclick = ()=>{ const s=$('#scroll'); s.scrollTop=s.scrollHeight; };
+$('#toTop').onclick = ()=>{ $('#scroll').scrollTop=0; };
+
+document.querySelectorAll('#roleFilter .seg-btn').forEach(b=>{
+  b.onclick=()=>{
+    roleFilter=b.dataset.role;
+    document.querySelectorAll('#roleFilter .seg-btn').forEach(x=>x.classList.toggle('active',x===b));
+    paint();
+  };
+});
+$('#onlyTools').onchange = paint;
+
+/* ---- search + keyboard nav ---- */
 function matches(s){
   const q=$('#q').value.trim().toLowerCase();
   if(!q) return true;
@@ -295,6 +447,30 @@ let debounce=null;
 $('#q').addEventListener('input',()=>{
   clearTimeout(debounce);
   debounce=setTimeout(()=>renderList(sessions.filter(matches)),120);
+});
+
+// Keyboard: / focuses search, r refreshes, b bottom, t top, e expand, c collapse,
+// Esc clears the search, ↑/↓ walk the (filtered) session list and open.
+document.addEventListener('keydown',e=>{
+  const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+  if(e.key==='/' && !typing){ e.preventDefault(); $('#q').focus(); return; }
+  if(e.key==='Escape'){ $('#q').blur(); $('#q').value=''; renderList(sessions.filter(matches)); return; }
+  if(typing) return;
+  if(e.key==='r'){ $('#refresh').click(); return; }
+  if(e.key==='b'){ $('#toBottom').click(); return; }
+  if(e.key==='t'){ $('#toTop').click(); return; }
+  if(e.key==='e'){ $('#expandAll').click(); return; }
+  if(e.key==='c'){ $('#collapseAll').click(); return; }
+  if(e.key==='ArrowDown' || e.key==='ArrowUp'){
+    const rows = [...document.querySelectorAll('#list .sess')];
+    if(!rows.length) return;
+    e.preventDefault();
+    let i = rows.findIndex(r=>r.dataset.id===current);
+    i = e.key==='ArrowDown' ? (i<0?0:i+1) : (i<0?rows.length-1:i-1);
+    i = Math.max(0, Math.min(rows.length-1, i));
+    openSession(rows[i].dataset.id);
+    rows[i].scrollIntoView({block:'nearest'});
+  }
 });
 
 loadSessions().catch(e=>{
