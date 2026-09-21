@@ -129,9 +129,12 @@ hermes_fetch(base_host<String>, base_port<Int>, path<String>, token<String>)<Str
 hermes_fetch_with_token(host<String>, port<Int>, path<String>, token<String>)<String> -> {
     req<String> = "GET " + path + " HTTP/1.1\r\n"
     req = req.concat("Host: " + host + "\r\n")
-    if (token.len() > 0) {
-        req = req.concat("X-Hermes-Session-Token: " + token + "\r\n")
-    }
+    // Attach the session token only when we actually have one: a match on
+    // emptiness states both outcomes instead of leaving the guard implicit.
+    req = req.concat(match (token.len() > 0) {
+        true -> "X-Hermes-Session-Token: " + token + "\r\n"
+        false -> ""
+    })
     req = req.concat("Connection: close\r\n\r\n")
     return http_round_trip(host, port, req)
 }
@@ -168,14 +171,10 @@ handle(head<String>, static_dir<String>, token<String>, base_host<String>, base_
         "/" -> { return serve_file(static_dir + "/index.html", "text/html; charset=utf-8") }
         "/index.html" -> { return serve_file(static_dir + "/index.html", "text/html; charset=utf-8") }
         "/healthz" -> { return respond(200, "application/json", "{\"ok\":true}") }
-        ? -> {
-            // API proxy: pass through to Hermes with our stored token.
-            if (path.starts_with("/api/")) {
-                upstream<String> = hermes_fetch_with_token(base_host, base_port, path, token)
-                return relay(upstream)
-            }
-            return respond(404, "application/json", "{\"error\":\"not found\"}")
-        }
+        ? -> { return match (path.starts_with("/api/")) {
+            true -> relay(hermes_fetch_with_token(base_host, base_port, path, token))
+            false -> respond(404, "application/json", "{\"error\":\"not found\"}")
+        } }
     }
 }
 
@@ -201,9 +200,12 @@ strip_http_head(raw<String>)<String> -> {
 // display HTML as source. Build the head here so each route can declare its own
 // type. (Body is always UTF-8 text in this server.)
 respond(status<Int>, ctype<String>, body<String>)<String> -> {
-    reason<String> = "OK"
-    if (status == 404) { reason = "Not Found" }
-    if (status == 500) { reason = "Internal Server Error" }
+    // Reason phrase: one subject, one dispatch, explicit catch-all arm.
+    reason<String> = match (status) {
+        404 -> "Not Found"
+        500 -> "Internal Server Error"
+        ? -> "OK"
+    }
     tpl<String> = "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n"
     head<String> = tpl.format(status, reason, ctype, body.len())
     return head.concat(body)
