@@ -1,0 +1,541 @@
+// writer.vyb — VybRover's WebSocket writer: attach to a stored Hermes session
+// and continue the discussion.
+//
+// WHY A WEBSOCKET: Hermes exposes no HTTP route that submits a turn. Across its
+// whole OpenAPI surface there is no `POST` for turns / steer / interrupt; the
+// write verbs exist ONLY as JSON-RPC methods over `/api/ws` (`prompt.submit`,
+// `session.resume`, `session.branch`). A reader can live on REST; a writer
+// cannot. So this module holds a real RFC 6455 socket (the `websocket` stdlib
+// module) and speaks JSON-RPC over it.
+//
+// WHY A THREAD: a turn is long-lived (the model streams for seconds). VybRover's
+// accept loop serves one connection at a time, so holding the WS there would
+// freeze the transcript view for every other request. Each writer session runs
+// on its own detached thread and pushes events into a String channel the reader
+// drains.
+//
+// THE LEASE RULE: Hermes allows exactly one live writer per conversation
+// (`PER_SESSION_EXCLUSIVE_SUBMIT`). Writing into a session already held by a TUI
+// or another window is refused with code 4090 / reason SESSION_NOT_OWNED — and
+// that refusal is surfaced verbatim, never papered over. Continuing a discussion
+// that somebody else holds goes through `branch`, which forks a NEW stored
+// session carrying the parent's history; the original is left untouched.
+//
+// Fallibility: every transport op is `T?`; absence is the failed call. The
+// upstream's own error strings (4090 and friends) are relayed as text, because
+// inventing a friendlier message would hide the one thing the user needs.
+
+import websocket::{ws_connect, ws_send_text, ws_recv_frame, ws_recv_text,
+                   ws_encode_frame, ws_close, ws_error_message, ws_error_code,
+                   WsConn, WsSocket, WsFrame, WsOpcode, WsRead}
+import network::{socket_send, socket_close}
+import rand::{rand_range}
+import channels::{strchan_new, strchan_send, strchan_close}
+import threads::{thread_spawn, thread_detach}
+import time::{sleep_ms}
+
+// --- JSON scraping -----------------------------------------------------------
+// The transcript reader already relays Hermes' JSON verbatim rather than parsing
+// it; the writer only needs to pluck a couple of scalar fields out of a reply
+// frame (a session id, a status). A full JSON parser would be a much bigger
+// piece of machinery than this needs, and a hand-rolled one is where a writer
+// would quietly corrupt a payload. So: find the key, read to the closing quote.
+
+// The string value of `"key"` in `s`, or "" when absent. Handles the escaped
+// quote sequence Hermes emits inside ids/titles.
+//
+// Hermes' serializer puts a SPACE after the colon (`"role": "user"`), so both
+// spacings are probed: a search for `"key":"` alone would miss every field.
+json_string_field(s<String>, key<String>)<String> -> {
+    spaced<String> = "\"" + key + "\": \""
+    tight<String> = "\"" + key + "\":\""
+    start<Int> = value_start(s, spaced)
+    if (start < 0) { start = value_start(s, tight) }
+    if (start < 0) { return "" }
+    i<Int> = start
+    out<String> = ""
+    while (i < s.len()) {
+        c<String> = s.substring(i, i + 1)
+        if (c == "\"") { return out }
+        // A backslash escapes the next character; emit both so an escaped quote
+        // inside the value does not terminate it early.
+        if (c == "\\") {
+            if (i + 1 < s.len()) {
+                out = out.concat(c)
+                out = out.concat(s.substring(i + 1, i + 2))
+                i = i + 2
+            } else {
+                out = out.concat(c)
+                i = i + 1
+            }
+        } else {
+            out = out.concat(c)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Index just past the opening quote of `needle`, or -1 when `needle` is absent.
+value_start(s<String>, needle<String>)<Int> -> {
+    pos<Int> = s.index_of(needle)
+    if (pos < 0) { return -1 }
+    return pos + needle.len()
+}
+
+// Like `json_string_field`, but finds the LAST occurrence of `key` instead of the
+// first.
+//
+// Why this matters here: Hermes' replies embed the entire transcript, and a
+// transcript message may itself carry a `session_id` field (a tool result
+// quoting one, a resumed-session note). The reply's own top-level field is
+// serialized last, so scanning from the end reaches it instead of a nested
+// look-alike. Vyb's String surface has no `last_index_of`, so the scan walks
+// backwards over the raw characters itself.
+json_string_field_last(s<String>, key<String>)<String> -> {
+    needle<String> = "\"" + key + "\": \""
+    n<Int> = needle.len()
+    if (s.len() < n) { return "" }
+    i<Int> = s.len() - n
+    while (i >= 0) {
+        if (s.substring(i, i + n) == needle) {
+            return json_string_field(s.substring(i, s.len()), key)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// True when `s` contains `key` as a JSON string field with value `value`.
+json_has(s<String>, key<String>, value<String>)<Bool> -> {
+    return json_string_field(s, key) == value
+}
+
+// --- framing -----------------------------------------------------------------
+
+// Wrap a JSON-RPC request as one text frame. `id` is echoed back by the server,
+// which is how replies are matched to requests.
+rpc(method<String>, params<String>, id<Int>)<String> -> {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id.to_string() +
+           ",\"method\":\"" + method + "\",\"params\":" + params + "}"
+}
+
+// --- the writer session ------------------------------------------------------
+
+// A live writer: the socket, the stored session it is attached to, and the
+// channel the reader drains.
+share(all)
+struct Writer {
+    conn<WsConn>,
+    // The stored id the user sees (a branch's child id when forked).
+    stored_id<String>,
+    // The runtime id this live session is addressed by. `session.resume` returns
+    // it, and every later RPC (prompt.submit) uses it -- sending the stored id
+    // there fails.
+    live_id<String>,
+    events<Int>,
+    open<Bool>
+}
+
+// Attach to `stored_id` and continue the discussion.
+//
+// `fork` false -> `session.resume`: take the session as-is. Refused with 4090
+//   when another writer (a TUI, another window) holds it.
+// `fork` true  -> resume first, THEN `session.branch`: fork a NEW stored child
+//   carrying the parent's history, leaving the original untouched. The resume is
+//   not optional — `session.branch` refuses an id it has not loaded ("session
+//   not found", code 4001).
+//
+// Returns the live writer, or absent when the handshake or the attach failed.
+// Hermes' own refusal text (4090/SESSION_NOT_OWNED) is pushed onto the channel
+// verbatim as `error:<message>`, never replaced with friendlier wording.
+//
+// `new` true -> start a FRESH conversation with `session.create` (no resume, no
+//   parent). `stored_id` is ignored; it is passed as the new session's title, so
+//   an empty one is fine.
+share(all)
+writer_attach(base_host<String>, base_port<Int>, token<String>, stored_id<String>,
+              fork<Bool>, new_chat<Bool>, cwd<String>, events<Int>)<Writer?> -> {
+    path<String> = "/api/ws?token=" + token
+    conn<WsConn> = ws_connect(base_host, base_port, path, 20000) else WsConn {
+        ws = ws_reset_socket(), pending = "" }
+    if (conn.ws.fd < 0) { return Writer?() }
+
+    // Step 0 (new chat): create a session outright. There is no parent to resume
+    // and nothing to branch, so this is the whole attach -- and the reply already
+    // carries `session_id` (runtime id) and `stored_session_id`, so no scraping
+    // of a large transcript is needed.
+    if (new_chat) {
+        // `cwd` matters: Hermes otherwise picks its own default, and a session
+        // whose cwd is not this project shows the wrong context. `title` keeps
+        // the list readable -- the session appears in the left rail like any other.
+        create_params<String> = "{\"title\":\"New discussion\",\"cwd\":\"" +
+                                json_escape_text(cwd) + "\"}"
+        sent0<Bool> = ws_send_text(conn.ws, rpc("session.create", create_params, 3)) else false
+        if (!sent0) {
+            ws_close(conn.ws, 1000, "create failed")
+            return Writer?()
+        }
+        reply0<String> = await_rpc_reply(conn, 3, conn.pending, 400) else ""
+        if (reply0.len() == 0) {
+            strchan_send(events, "error:no reply to session.create")
+            ws_close(conn.ws, 1000, "create failed")
+            return Writer?()
+        }
+        if (reply0.index_of("\"error\"") >= 0) {
+            strchan_send(events, "error:" + error_message(reply0))
+            ws_close(conn.ws, 1000, "create refused")
+            return Writer?()
+        }
+        // `last` because a create reply's payload can itself mention ids.
+        child<String> = json_string_field_last(reply0, "stored_session_id")
+        child_live<String> = json_string_field_last(reply0, "session_id")
+        if (child.len() == 0) { child = stored_id }
+        if (child_live.len() == 0) { child_live = child }
+        w<Writer> = Writer { conn = conn, stored_id = child, live_id = child_live,
+                             events = events, open = true }
+        strchan_send(events, "new:" + child)
+        return Writer?(w)
+    }
+
+    // Step 1: resume the stored session so it is loaded on this connection.
+    //
+    // `omit_messages` is REQUIRED, not an optimization. Without it the reply
+    // embeds the whole transcript -- a long session is ~500 KB, and its tool-call
+    // rows carry their OWN `"session_id"` fields (process ids like
+    // `proc_44d908a56824`). A first-match scrape then returns a tool record
+    // instead of the session, and `session.branch` answers "session not found"
+    // (code 4001) for an id that looks plausible. With the transcript omitted the
+    // reply is ~3.6 KB and the runtime id is the only `"session_id"` in it.
+    resume_params<String> = "{\"session_id\":\"" + json_escape_text(stored_id) +
+                            "\",\"omit_messages\":true}"
+    sent<Bool> = ws_send_text(conn.ws, rpc("session.resume", resume_params, 1)) else false
+    if (!sent) {
+        ws_close(conn.ws, 1000, "attach failed")
+        return Writer?()
+    }
+
+    reply<String> = await_rpc_reply(conn, 1, conn.pending, 400) else ""
+    if (reply.len() == 0) {
+        ws_close(conn.ws, 1000, "no reply")
+        return Writer?()
+    }
+    if (reply.index_of("\"error\"") >= 0) {
+        // Surface Hermes' own message: a 4090 refusal must reach the user as-is.
+        strchan_send(events, "error:" + error_message(reply))
+        ws_close(conn.ws, 1000, "attach refused")
+        return Writer?()
+    }
+
+    // The runtime id differs from the stored id, and every later call addresses
+    // the runtime one; capture it from the reply.
+    live_id<String> = json_string_field_last(reply, "session_id")
+    if (live_id.len() == 0) { live_id = stored_id }
+
+    if (!fork) {
+        w<Writer> = Writer { conn = conn, stored_id = stored_id, live_id = live_id,
+                             events = events, open = true }
+        strchan_send(events, "attached:" + stored_id)
+        return Writer?(w)
+    }
+
+    // Step 2 (fork): branch off the now-live session. The child gets its own
+    // stored id and its own lease, so the parent is never written to.
+    // NOTE: `omit_messages` is accepted by `session.resume` but REJECTED by
+    // `session.branch` ("Extra inputs are not permitted"), so the branch reply
+    // always embeds the child's transcript (~100 KB and growing with every
+    // turn). That is why the reader below gets a large frame budget: the reply
+    // is legitimately big, and giving up early surfaced as
+    // "no reply to session.branch".
+    branch_params<String> = "{\"session_id\":\"" + json_escape_text(live_id) + "\"}"
+    sent2<Bool> = ws_send_text(conn.ws, rpc("session.branch", branch_params, 2)) else false
+    if (!sent2) {
+        ws_close(conn.ws, 1000, "branch failed")
+        return Writer?()
+    }
+    reply2<String> = await_rpc_reply(conn, 2, "", 400) else ""
+    if (reply2.len() == 0) {
+        strchan_send(events, "error:no reply to session.branch")
+        ws_close(conn.ws, 1000, "branch failed")
+        return Writer?()
+    }
+    if (reply2.index_of("\"error\"") >= 0) {
+        strchan_send(events, "error:" + error_message(reply2))
+        ws_close(conn.ws, 1000, "branch refused")
+        return Writer?()
+    }
+    child<String> = json_string_field_last(reply2, "stored_session_id")
+    child_live<String> = json_string_field_last(reply2, "session_id")
+    if (child.len() == 0) { child = stored_id }
+    if (child_live.len() == 0) { child_live = live_id }
+
+    w<Writer> = Writer { conn = conn, stored_id = child, live_id = child_live,
+                         events = events, open = true }
+    strchan_send(events, "branch:" + child)
+    return Writer?(w)
+}
+
+// A zeroed socket, so a failed `ws_connect` can still be destructured. fd < 0 is
+// the module's own "not connected" marker (not a value smuggled as data: it
+// never leaves this module).
+ws_reset_socket()<WsSocket> -> {
+    return WsSocket { fd = -1, host = "", port = 0, path = "" }
+}
+
+// Hermes' error envelope as a readable string: the message plus the reason code
+// when present, so 4090/SESSION_NOT_OWNED is recognizable.
+error_message(reply<String>)<String> -> {
+    msg<String> = json_string_field(reply, "message")
+    reason<String> = json_string_field(reply, "reason")
+    if (reason.len() > 0) { return msg + " (" + reason + ")" }
+    if (msg.len() > 0) { return msg }
+    return reply
+}
+
+// --- reading replies ---------------------------------------------------------
+
+// Read frames until the reply with id `want` arrives (or `tries` frames pass).
+// Events interleaved with the reply are pushed onto the channel, so a caller
+// that streams still sees them.
+await_rpc_reply(ws<WsConn>, want<Int>, pending<String>, tries<Int>)<String?> -> {
+    return await_rpc_from(ws, want, pending, tries, 0)
+}
+
+await_rpc_from(ws<WsConn>, want<Int>, pending<String>, tries<Int>, seen<Int>)<String?> -> {
+    if (seen >= tries) { return String?() }
+    frame<String> = ws_recv_text(ws.ws, pending) else ""
+    if (frame.len() == 0) { return String?() }
+    // A reply is identified by its id. Hermes serializes with spaces after the
+    // colon (`"id": 1`), so a bare `"id":1` search misses every reply -- both
+    // spacings are accepted here rather than assuming one encoding.
+    if (frame.index_of("\"id\":" + want.to_string()) >= 0 ||
+        frame.index_of("\"id\": " + want.to_string()) >= 0) {
+        return String?(frame)
+    }
+    return await_rpc_from(ws, want, "", tries, seen + 1)
+}
+
+// --- the writer thread -------------------------------------------------------
+
+// Run one writer session on a detached thread until the turn ends or the peer
+// closes. Events land on `events`:
+//   attached:<stored_id>   the session is live
+//   delta:<text>           a streamed chunk of the reply
+//   done:<text>            the turn finished (full text)
+//   error:<message>        a refusal or transport failure
+share(all)
+writer_run(base_host<String>, base_port<Int>, token<String>, stored_id<String>,
+           fork<Bool>, events<Int>)<Int> -> {
+    h<Int> = thread_spawn(|| -> {
+        got<Writer> = writer_attach(base_host, base_port, token, stored_id, fork, events) else Writer {
+            conn = WsConn { ws = ws_reset_socket(), pending = "" },
+            stored_id = "", live_id = "", events = events, open = false }
+        if (!got.open) {
+            strchan_send(events, "error:" + ws_error_message())
+            strchan_close(events)
+            return 1
+        }
+        // Hold the session: wait for prompts on... the socket. In practice the
+        // reader submits through submit_turn() below; this thread keeps reading
+        // so streamed events reach the channel.
+        return drain_until_close(got)
+    }) else -1
+    if (h >= 0) { thread_detach(h) }
+    return 0
+}
+
+// Start reading a live writer on its OWN thread: every event is pushed onto the
+// writer's channel until the peer closes. Returns immediately with the thread
+// handle (absent when it could not be spawned).
+//
+// This must run concurrently with `writer_submit`: a turn's deltas arrive over
+// the same socket the submit was written to, so a caller that submits and then
+// tries to read on the same thread is racing itself.
+share(all)
+writer_stream(w<Writer>)<Int?> -> {
+    h<Int> = thread_spawn(|| -> drain_until_close(w)) else -1
+    if (h < 0) { return Int?() }
+    thread_detach(h)
+    return Int?(h)
+}
+
+// Read frames from a live writer and push them onto its channel. Returns when
+// the peer closes or a guard elapses.
+//
+// The ONE reader: every frame is classified here, so no other thread may read
+// this socket. Classes:
+//   reply:<status>        a JSON-RPC reply the server accepted (\"streaming\")
+//   answer:<text>         a chunk of the assistant's visible answer
+//   thinking:<text>       a chunk of its reasoning (shown collapsed)
+//   tool:<text>           a tool call the model started
+//   done:<text>           the turn completed
+//   error:<message>       a refusal (4090/SESSION_NOT_OWNED reaches the user)
+//
+// Hermes names its events in params.type; the payload's text lives under
+// payload.text. Getting the type wrong here is not cosmetic: `thinking.delta`
+// and `reasoning.delta` carry the model's private reasoning, which is a very
+// different thing on screen from the answer it is about to give.
+share(all)
+drain_until_close(w<Writer>)<Int> -> {
+    guard<Int> = 0
+    // A read timeout is NOT a close. `ws_recv_text` returns absent both when the
+    // peer really closed and when the socket simply had nothing to say for the
+    // timeout window -- and a conversation is mostly quiet (the model thinks for
+    // seconds, tools run for minutes). Treating a quiet stretch as EOF tore the
+    // reader down on the first lull and closed the channel, after which every
+    // poll returned "[]" forever: the pane looked like it had hung mid-turn.
+    // So a timeout retries; only a CLOSE opcode or a real transport failure ends
+    // the loop, and both are distinguished below.
+    while (guard < 100000) {
+        // Read the RAW frame: `ws_recv_text` collapses "no frame yet" and "a
+        // frame with an empty payload" into the same "", so a bare control frame
+        // would look like end-of-stream and tear the reader down mid-turn. The
+        // opcode is the only honest discriminator.
+        got<WsRead> = ws_recv_frame(w.conn.ws, "") else WsRead {
+            frame = WsFrame { opcode = WsOpcode::CLOSE, data = "", fin = true },
+            rest = ""
+        }
+        if (got.frame.opcode == WsOpcode::CLOSE) {
+            // Either the peer closed the stream or the read timed out: the
+            // transport error tells a quiet window (EAGAIN/ETIMEDOUT) from a real
+            // end (peer close, closed descriptor). Only a quiet window may retry
+            // -- a model can think for minutes before its first delta, and the
+            // old lull heuristic closed the channel, leaving the pane blank for
+            // the rest of the session.
+            code<Int> = ws_error_code()
+            if (code == 11 || code == 110) {
+                sleep_ms(50)
+                guard = guard + 1
+                continue
+            }
+            // The stream is over for real. Release the descriptor HERE -- the
+            // reader is the fd's owner, so the number cannot be handed to a new
+            // attach while this thread is still mid-read on it (see
+            // writer_signal_close for what going wrong there looks like).
+            socket_close(w.conn.ws.fd)
+            strchan_send(w.events, "done:")
+            strchan_close(w.events)
+            return 0
+        }
+        frame<String> = got.frame.data
+        if (frame.len() == 0) {
+            // An empty data frame ends nothing: skip it and keep reading.
+            guard = guard + 1
+            continue
+        }
+        if (frame.index_of("\"error\"") >= 0) {
+            strchan_send(w.events, "error:" + error_message(frame))
+            guard = guard + 1
+            continue
+        }
+        kind<String> = json_string_field(frame, "type")
+        if (kind == "text.delta" || kind == "message.delta" || kind == "answer.delta") {
+            strchan_send(w.events, "answer:" + text_of(frame))
+        } else {
+            if (kind == "reasoning.delta" || kind == "thinking.delta") {
+                strchan_send(w.events, "thinking:" + text_of(frame))
+            } else {
+                if (kind == "tool.start" || kind == "tool.call") {
+                    strchan_send(w.events, "tool:" + text_of(frame))
+                } else {
+                    if (kind == "turn.complete" || kind == "message.complete") {
+                        strchan_send(w.events, "done:" + text_of(frame))
+                    } else {
+                        if (kind == "message.start") {
+                            strchan_send(w.events, "start:")
+                        } else {
+                            // A bare JSON-RPC reply to something we sent. Report
+                            // the server's own status, so the caller can tell
+                            // "streaming" from a refusal without re-parsing.
+                            status<String> = json_string_field(frame, "status")
+                            if (status.len() > 0) { strchan_send(w.events, "reply:" + status) }
+                        }
+                    }
+                }
+            }
+        }
+        guard = guard + 1
+    }
+    strchan_send(w.events, "error:event reader hit its guard")
+    return 1
+}
+
+// Ask the peer to close, WITHOUT releasing the descriptor.
+//
+// `stdlib/websocket`'s `ws_close()` sends the CLOSE frame and then closes the
+// fd itself. That is right for an owner that has no other reader, but wrong
+// here: our stream reader thread may be blocked in `recv` on that very file
+// descriptor, and freeing the number lets the kernel hand it straight to the
+// next attach's connection -- after which the stale reader would be consuming
+// another conversation's frames into its dead channel, silently losing the live
+// session's deltas. So detach only sends the CLOSE frame; Hermes tears the
+// connection down, the reader sees the real end and releases the descriptor
+// itself (see drain_until_close), and only then may the number be reused.
+share(all)
+writer_signal_close(w<Writer>) -> {
+    body<String> = String::from_byte((1000 / 256) % 256)
+    body = body.concat(String::from_byte(1000 % 256))
+    body = body.concat("detached")
+    seed<Int> = rand_range(0, 2147483647)
+    frame<String> = ws_encode_frame(WsOpcode::CLOSE, body, true, seed)
+    socket_send(w.conn.ws.fd, frame)
+}
+
+// The streamed text inside an event frame. Hermes nests it under payload.text;
+// a delta may also carry `delta`. Checked in order, first non-empty wins.
+text_of(frame<String>)<String> -> {
+    t<String> = json_string_field(frame, "text")
+    if (t.len() > 0) { return t }
+    return json_string_field(frame, "delta")
+}
+
+// --- submitting a turn -------------------------------------------------------
+
+// Send the user's turn on a live writer.
+//
+// WRITE-ONLY BY DESIGN: exactly one thread reads this socket (the streaming
+// thread). A submit that also read its own reply would race that reader for the
+// same frames -- whichever thread won the race would swallow the deltas the
+// other needed. So this sends the frame and returns; the server's reply arrives
+// as a normal channel event (`reply:<id>` on acceptance, `error:<message>` on
+// refusal), classified by the streaming thread like every other frame.
+//
+// Returns true when the frame went out. Whether the server ACCEPTED the turn is
+// the `reply:`/`error:` event that follows -- the send's success says nothing
+// about the lease, and a 4090 refusal must not look like an accepted turn.
+share(all)
+writer_submit(w<Writer>, text<String>, seq<Int>)<Bool> -> {
+    if (!w.open) { return false }
+    params<String> = "{\"session_id\":\"" + w.live_id +
+                     "\",\"text\":\"" + json_escape_text(text) + "\"}"
+    sent<Bool> = ws_send_text(w.conn.ws, rpc("prompt.submit", params, seq)) else false
+    if (!sent) {
+        strchan_send(w.events, "error:prompt.submit send failed")
+        return false
+    }
+    return true
+}
+
+// Escape a user's message for embedding in a JSON string. The composer's text is
+// arbitrary, so control characters and quotes must not break the envelope.
+//
+// Exported as `json_escape_text`: vybrover.vyb has its own `json_escape`, and a
+// bare `json_escape` import would be a redefinition in that scope.
+share(all)
+json_escape_text(s<String>)<String> -> {
+    out<String> = ""
+    i<Int> = 0
+    while (i < s.len()) {
+        c<String> = s.substring(i, i + 1)
+        match (c) {
+            "\"" -> { out = out.concat("\\\"") }
+            "\\" -> { out = out.concat("\\\\") }
+            "\n" -> { out = out.concat("\\n") }
+            "\r" -> { out = out.concat("\\r") }
+            "\t" -> { out = out.concat("\\t") }
+            ? -> { out = out.concat(c) }
+        }
+        i = i + 1
+    }
+    return out
+}
