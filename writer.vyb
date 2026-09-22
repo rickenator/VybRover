@@ -25,8 +25,11 @@
 // upstream's own error strings (4090 and friends) are relayed as text, because
 // inventing a friendlier message would hide the one thing the user needs.
 
-import websocket::{ws_connect, ws_send_text, ws_recv_text, ws_close,
-                   ws_error_message, WsConn, WsSocket}
+import websocket::{ws_connect, ws_send_text, ws_recv_frame, ws_recv_text,
+                   ws_encode_frame, ws_close, ws_error_message, ws_error_code,
+                   WsConn, WsSocket, WsFrame, WsOpcode, WsRead}
+import network::{socket_send, socket_close}
+import rand::{rand_range}
 import channels::{strchan_new, strchan_send, strchan_close}
 import threads::{thread_spawn, thread_detach}
 import time::{sleep_ms}
@@ -383,22 +386,43 @@ drain_until_close(w<Writer>)<Int> -> {
     // poll returned "[]" forever: the pane looked like it had hung mid-turn.
     // So a timeout retries; only a CLOSE opcode or a real transport failure ends
     // the loop, and both are distinguished below.
-    quiet<Int> = 0
     while (guard < 100000) {
-        frame<String> = ws_recv_text(w.conn.ws, "") else ""
-        if (frame.len() == 0) {
-            quiet = quiet + 1
-            if (quiet < 300) {
+        // Read the RAW frame: `ws_recv_text` collapses "no frame yet" and "a
+        // frame with an empty payload" into the same "", so a bare control frame
+        // would look like end-of-stream and tear the reader down mid-turn. The
+        // opcode is the only honest discriminator.
+        got<WsRead> = ws_recv_frame(w.conn.ws, "") else WsRead {
+            frame = WsFrame { opcode = WsOpcode::CLOSE, data = "", fin = true },
+            rest = ""
+        }
+        if (got.frame.opcode == WsOpcode::CLOSE) {
+            // Either the peer closed the stream or the read timed out: the
+            // transport error tells a quiet window (EAGAIN/ETIMEDOUT) from a real
+            // end (peer close, closed descriptor). Only a quiet window may retry
+            // -- a model can think for minutes before its first delta, and the
+            // old lull heuristic closed the channel, leaving the pane blank for
+            // the rest of the session.
+            code<Int> = ws_error_code()
+            if (code == 11 || code == 110) {
                 sleep_ms(50)
                 guard = guard + 1
                 continue
             }
-            // ~15s of nothing AND no intervening traffic: treat as a dead peer.
+            // The stream is over for real. Release the descriptor HERE -- the
+            // reader is the fd's owner, so the number cannot be handed to a new
+            // attach while this thread is still mid-read on it (see
+            // writer_signal_close for what going wrong there looks like).
+            socket_close(w.conn.ws.fd)
             strchan_send(w.events, "done:")
             strchan_close(w.events)
             return 0
         }
-        quiet = 0
+        frame<String> = got.frame.data
+        if (frame.len() == 0) {
+            // An empty data frame ends nothing: skip it and keep reading.
+            guard = guard + 1
+            continue
+        }
         if (frame.index_of("\"error\"") >= 0) {
             strchan_send(w.events, "error:" + error_message(frame))
             guard = guard + 1
@@ -434,6 +458,27 @@ drain_until_close(w<Writer>)<Int> -> {
     }
     strchan_send(w.events, "error:event reader hit its guard")
     return 1
+}
+
+// Ask the peer to close, WITHOUT releasing the descriptor.
+//
+// `stdlib/websocket`'s `ws_close()` sends the CLOSE frame and then closes the
+// fd itself. That is right for an owner that has no other reader, but wrong
+// here: our stream reader thread may be blocked in `recv` on that very file
+// descriptor, and freeing the number lets the kernel hand it straight to the
+// next attach's connection -- after which the stale reader would be consuming
+// another conversation's frames into its dead channel, silently losing the live
+// session's deltas. So detach only sends the CLOSE frame; Hermes tears the
+// connection down, the reader sees the real end and releases the descriptor
+// itself (see drain_until_close), and only then may the number be reused.
+share(all)
+writer_signal_close(w<Writer>) -> {
+    body<String> = String::from_byte((1000 / 256) % 256)
+    body = body.concat(String::from_byte(1000 % 256))
+    body = body.concat("detached")
+    seed<Int> = rand_range(0, 2147483647)
+    frame<String> = ws_encode_frame(WsOpcode::CLOSE, body, true, seed)
+    socket_send(w.conn.ws.fd, frame)
 }
 
 // The streamed text inside an event frame. Hermes nests it under payload.text;

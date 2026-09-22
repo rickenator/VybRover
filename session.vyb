@@ -20,9 +20,9 @@
 // session-id -> writer would be machinery with no caller, and would hold open
 // sockets nobody is watching.
 
-import writer::{writer_attach, writer_submit, writer_stream, Writer, json_escape_text}
+import writer::{writer_attach, writer_submit, writer_stream, writer_signal_close, Writer, json_escape_text}
 import channels::{strchan_new, strchan_try, strchan_close}
-import websocket::{ws_close, WsConn, WsSocket}
+import websocket::{WsConn, WsSocket}
 import threads::{mutex_new, mutex_lock, mutex_unlock}
 
 // The shared writer slot. `lock` is a runtime mutex handle (Int) guarding the
@@ -171,7 +171,7 @@ session_detach(s<our<Session>>) -> {
     mutex_lock(s.lock)
     live<Bool> = s.live
     ch<Int> = s.events
-    if (live) { ws_close(s.writer.conn.ws, 1000, "detached") }
+    if (live) { writer_signal_close(s.writer) }
     s.writer = zero_writer(-1)
     s.live = false
     mutex_unlock(s.lock)
