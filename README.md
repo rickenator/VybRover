@@ -18,24 +18,31 @@ VybRover does **not** patch Hermes' frontend. It talks to Hermes' REST API
 (`GET /api/sessions`, `/messages`) and serves its own UI, so a `hermes update` can never
 clobber it, and nothing in the Hermes install is modified.
 
-## Continuing a discussion
+## New chat, and continuing a discussion
 
-Reading needs only a `GET`; writing needs a **WebSocket**. Hermes exposes no HTTP route
-that submits a turn — across its API the write verbs (`prompt.submit`, `session.steer`,
-`session.redirect`, `session.interrupt`) exist only as JSON-RPC methods over `/api/ws`.
-Hermes' own Chat tab opens that socket for the same reason. VybRover holds it directly,
-using Vyb's `stdlib/websocket` (an RFC 6455 client), and streams the reply back to the
-page over its own `/api/events` poll.
+Reading needs only a `GET`; writing needs a **WebSocket**, on any of three paths:
 
-**Continuing forks.** Hermes refuses writes into a session another window holds
-(`4090 SESSION_NOT_OWNED`), so "continue this discussion" resumes the stored session and
-then branches it (`session.resume` → `session.branch`). The child gets its own lease and
-carries the parent's history; the original session is never written to. That is why the
-button says *continue*, not *reopen*: the transcript you were reading stays as it was.
+- **＋ New chat** — `session.create`: a fresh conversation, no parent.
+- **⑂ Continue** — resume the open transcript, then `session.branch` it: a new session carrying the
+  parent's history, leaving the original untouched.
+- **Resume** — take a session as-is (`/api/attach`), when no fork is wanted.
 
-One writer at a time: attaching again releases the previous lease, since the composer is
-a single conversation. `GET /api/state` reports what the slot holds, so a page reload
-reattaches instead of falsely showing "not attached".
+Hermes exposes no HTTP route that submits a turn — across its API the write verbs (`prompt.submit`,
+`session.steer`, `session.redirect`, `session.interrupt`) exist only as JSON-RPC methods over
+`/api/ws`. Hermes' own Chat tab opens that socket for the same reason. VybRover holds it directly,
+using Vyb's `stdlib/websocket` (an RFC 6455 client), and streams the reply back to the page over its
+own `/api/events` poll.
+
+**Why Continue forks.** Hermes refuses writes into a session another window holds (`4090
+SESSION_NOT_OWNED`), so continuing a transcript resumes it and then branches it. The child gets its
+own lease; the original is never written to. That is why the button says *continue*, not *reopen*:
+the transcript you were reading stays as it was.
+
+One writer at a time: attaching releases the previous lease, since the composer is a single
+conversation. `GET /api/state` reports what the slot holds, so a page reload reattaches instead of
+falsely showing "not attached", and **✕** releases it deliberately.
+
+Keyboard: **n** new chat, **Enter** sends (Shift+Enter is a newline).
 
 ## Requirements
 
@@ -68,6 +75,7 @@ a command line or in a transcript.
 | `HERMES_PORT` | `9119` | Hermes API port |
 | `VYBROVER_STATIC_DIR` | `.` | Directory holding `index.html` |
 | `VYBROVER_PORT` | `9210` | Port VybRover listens on |
+| `VYBROVER_CWD` | `.` | Working directory for sessions VybRover creates |
 
 ## Routes
 
@@ -75,6 +83,7 @@ a command line or in a transcript.
 |---|---|
 | `/` | The transcript UI (`index.html`) |
 | `/healthz` | Liveness: `{"ok":true}` |
+| `POST /api/new` | Start a fresh conversation (`session.create`, optional `{"title": "..."}`) |
 | `POST /api/fork` | Resume a session, branch it, and attach the writer (`{"session_id": "..."}`) |
 | `POST /api/attach` | Resume and attach without branching |
 | `POST /api/send` | Submit a turn on the attached writer (`{"text": "..."}`) |
@@ -126,14 +135,14 @@ Sending `asc`/`recent` to `/messages` or `limit=200` returns a `detail` error en
 ## Status
 
 Working end to end: session list, per-session transcript, collapsible tool calls,
-authenticated API proxy, **and the writer** — continue a discussion, fork it into a new
-session, submit turns, and stream the reply into the composer pane. Verified against a
-live Hermes instance:
+authenticated API proxy, **and the writer** — start a new chat, continue a discussion by forking it,
+submit turns, and stream the reply into the composer pane. Verified against a live Hermes instance:
 
-- fork from a stored session and from a branch child, both ~0.6 s
+- **＋ New chat** creating a fresh session in ~0.05 s, then a turn returning `NEW-CHAT-OK`
+- a fork of a stored session and of a branch child, each ~0.6 s
 - a submitted turn streaming `reply → start → thinking → answer → done`, with the final
-  answer rendered in the pane
-- a page reload reattaching to the live writer via `/api/state`
+  answer rendered in the pane (`msg bot: Hermes UI-NEWCHAT-OK`)
+- a page reload reattaching to the live writer via `/api/state`, and **✕** releasing it
 
 Not built: steering a turn mid-flight (`session.steer` / `session.interrupt`), attaching
 to a session another window currently holds (Hermes refuses it; fork is the sanctioned

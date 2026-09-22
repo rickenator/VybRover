@@ -204,13 +204,24 @@
   .write-status.live{
     color:var(--success); border-color:color-mix(in srgb,#4ade80 45%,transparent);
   }
-  .write-actions{padding:12px 14px 0}
+  /* Three peer actions in one row: New / Continue / release. "New chat" is the
+     primary entry point, so it carries weight; the others are secondary and
+     disabled until they apply. */
+  .write-actions{display:flex; gap:6px; padding:12px 14px 0}
+  .write-actions .btn{flex:1; padding:9px 8px; font-size:13px}
+  .write-actions .btn:last-child{flex:0 0 auto; padding:9px 11px}
+  .btn.ghost{background:transparent; color:var(--text-secondary)}
+  .btn.ghost:hover:not(:disabled){color:var(--midground)}
+  .write-note{
+    padding:9px 14px 0; font-size:12px; line-height:1.45; color:var(--text-secondary);
+  }
+  .write-note b{color:var(--midground); font-weight:600}
+  .dim{color:color-mix(in srgb,#ffe6cb 45%,transparent)}
   .btn.primary{
     background:color-mix(in srgb,#ffe6cb 90%,#041c1c); color:#041c1c;
     border-color:transparent; font-weight:600;
   }
   .btn.primary:disabled{opacity:.45; cursor:not-allowed}
-  .write-actions .btn{width:100%; padding:9px 10px}
 
   .write-log{
     flex:1; min-height:0; overflow-y:auto; padding:12px 14px;
@@ -289,23 +300,29 @@
 
   <aside class="write" id="write">
     <div class="write-head">
-      <div class="write-title">Continue</div>
-      <span id="writeStatus" class="write-status">not attached</span>
+      <span class="write-title" id="writeTitle">New chat</span>
+      <span id="writeStatus" class="write-status" title="Whether this pane holds a live writer">idle</span>
     </div>
 
     <div class="write-actions">
-      <button id="btnFork" class="btn primary" title="Branch this discussion into a new session and write there (the original is untouched)">⑂ Continue this discussion</button>
+      <button id="btnNew" class="btn" title="Start a fresh conversation (N)">＋ New chat</button>
+      <button id="btnFork" class="btn" title="Branch the open transcript into a new session and write there — the original is untouched" disabled>⑂ Continue</button>
+      <button id="btnDetach" class="btn ghost" title="Release this conversation" disabled>✕</button>
     </div>
+    <div class="write-note" id="writeNote">Start a new chat, or open a transcript and press <b>Continue</b> to pick it up.</div>
 
     <div class="write-log" id="writeLog">
-      <div class="write-empty">Open a session, then continue it here.<br>
-        Continuing forks the discussion into a new session, so the original stays as it was.</div>
+      <div class="write-empty">
+        <b>Nothing here yet.</b><br>
+        <span class="dim">Press ＋ New chat for a fresh conversation.</span>
+      </div>
     </div>
 
     <form class="write-form" id="writeForm">
-      <textarea id="writeText" class="write-text" rows="3" placeholder="Write a reply… (Enter to send, Shift+Enter for a newline)"></textarea>
+      <textarea id="writeText" class="write-text" rows="3"
+        placeholder="Write a message…  (Enter to send, Shift+Enter for a newline)"></textarea>
       <div class="write-form-row">
-        <span id="writeHint" class="hint"></span>
+        <span id="writeHint" class="hint">start a chat to begin</span>
         <button type="submit" id="btnSend" class="btn primary" disabled>Send</button>
       </div>
     </form>
@@ -381,6 +398,8 @@ function renderList(items){
 
 async function openSession(id){
   current = id; renderList(sessions.filter(matches));
+  // A transcript is now open, so "Continue" has something to branch from.
+  if(!$('#writeStatus').classList.contains('live')) $('#btnFork').disabled = false;
   const scroll = $('#scroll');
   scroll.innerHTML = '<div class="spin">Loading transcript…</div>';
   $('#title').textContent = shortId(id);
@@ -534,12 +553,13 @@ $('#q').addEventListener('input',()=>{
 });
 
 // Keyboard: / focuses search, r refreshes, b bottom, t top, e expand, c collapse,
-// Esc clears the search, ↑/↓ walk the (filtered) session list and open.
+// n new chat, Esc clears the search, ↑/↓ walk the (filtered) session list and open.
 document.addEventListener('keydown',e=>{
   const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
   if(e.key==='/' && !typing){ e.preventDefault(); $('#q').focus(); return; }
   if(e.key==='Escape'){ $('#q').blur(); $('#q').value=''; renderList(sessions.filter(matches)); return; }
   if(typing) return;
+  if(e.key==='n'){ newChat(); return; }
   if(e.key==='r'){ $('#refresh').click(); return; }
   if(e.key==='b'){ $('#toBottom').click(); return; }
   if(e.key==='t'){ $('#toTop').click(); return; }
@@ -586,13 +606,18 @@ function logMsg(cls, role, text){
   return el;
 }
 
+/* One place decides what the pane looks like, so "attached" and "idle" cannot
+   drift apart across three entry points. */
 function setStatus(text, live){
   const el = $('#writeStatus');
   el.textContent = text;
   el.classList.toggle('live', !!live);
+  $('#writeTitle').textContent = live ? 'Chat' : 'New chat';
   $('#btnSend').disabled = !live;
-  $('#writeText').disabled = !live;
-  $('#writeHint').textContent = live ? '' : 'continue this discussion first';
+  $('#btnDetach').disabled = !live;
+  $('#writeHint').textContent = live ? '' : 'start a chat to begin';
+  // "Continue" needs a transcript to branch from; it is meaningless without one.
+  $('#btnFork').disabled = !live && !current;
 }
 
 async function post(path, body){
@@ -603,27 +628,51 @@ async function post(path, body){
   return r.json().catch(()=>({error:`HTTP ${r.status}`}));
 }
 
-/* Continue the currently-open discussion in a new session. */
-async function continueSession(){
-  if(!current){ $('#writeHint').textContent = 'open a session first'; return; }
-  $('#btnFork').disabled = true;
-  $('#writeHint').textContent = 'forking…';
+/* Attach, whichever way. `mode` is 'new' | 'fork' | 'resume'.
+   All three end in the same place: one live writer, drained by pollEvents. */
+async function attach(mode, busyText){
+  $('#writeHint').textContent = busyText;
+  $('#btnNew').disabled = $('#btnFork').disabled = true;
   try {
-    const j = await post('/api/fork', {session_id: current});
+    const body = mode === 'new' ? {} : {session_id: current};
+    const j = await post(`/api/${mode}`, body);
     if(j.error){
       // Hermes' own refusal text is the useful part; relay it verbatim.
       const why = (j.events||[]).map(e=>e.text).filter(Boolean).join(' ') || j.error;
       logMsg('err', 'error', why);
-      $('#writeHint').textContent = 'fork refused';
+      $('#writeHint').textContent = 'could not attach';
       return;
     }
     attached = j.stored_id;
     setStatus(`live · ${shortId(attached)}`, true);
-    logMsg('note', null, `Continued in a new session (${attached}). The original is unchanged.`);
+    logMsg('note', null, mode === 'new'
+      ? `Started a new conversation (${attached}).`
+      : `Continued in a new session (${attached}). The original is unchanged.`);
     if(!polling) pollEvents();
   } finally {
-    $('#btnFork').disabled = false;
+    $('#btnNew').disabled = false;
+    if(current) $('#btnFork').disabled = false;
   }
+}
+
+/* ＋ New chat: a fresh conversation, no parent. */
+function newChat(){
+  if(attached && !confirm('Start a new chat? This one stays on record, but this pane moves on.')) return;
+  attach('new', 'starting…');
+}
+/* ⑂ Continue: branch the open transcript. */
+function continueSession(){
+  if(!current){ $('#writeHint').textContent = 'open a transcript first'; return; }
+  attach('fork', 'continuing…');
+}
+/* ✕: release the lease so Hermes stops holding the session for us. */
+async function detach(){
+  await post('/api/detach', {});
+  attached = null;
+  $('#writeLog').innerHTML = '<div class="write-empty"><b>Released.</b><br>' +
+    '<span class="dim">Press ＋ New chat for a fresh conversation.</span></div>';
+  pending = null;
+  setStatus('idle', false);
 }
 
 /* Drain VybRover's event buffer and paint the streamed turn. */
@@ -669,6 +718,11 @@ async function pollEvents(){
         } else if(ev.kind === 'error'){
           logMsg('err', 'error', ev.text);
           pending = null;
+        } else if(ev.kind === 'new' || ev.kind === 'branch'){
+          // The slot's id can differ from what the caller assumed -- a new chat
+          // is named here, and a branch child likewise. Keep them in sync.
+          attached = ev.text;
+          setStatus(`live · ${shortId(attached)}`, true);
         }
       }
     }
@@ -705,12 +759,24 @@ async function recoverWriter(){
   } catch(e){ /* no writer yet: leave the pane in its empty state */ }
 }
 
+$('#btnNew').addEventListener('click', newChat);
 $('#btnFork').addEventListener('click', continueSession);
+$('#btnDetach').addEventListener('click', detach);
 $('#writeForm').addEventListener('submit', e=>{ e.preventDefault(); sendTurn(); });
 $('#writeText').addEventListener('keydown', e=>{
   // Enter sends; Shift+Enter is a newline. The usual composer convention.
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendTurn(); }
 });
+
+// Focus the composer when the pane becomes usable, so a new chat is one
+// keystroke away from a message.
+new MutationObserver(()=>{
+  if(!$('#btnSend').disabled) $('#writeText').focus();
+}).observe($('#btnSend'), {attributes:true, attributeFilter:['disabled']});
+
+// The pane starts idle; `recoverWriter` promotes it if the server holds a live
+// writer (a reload must not silently orphan a running conversation).
+setStatus('idle', false);
 </script>
 </body>
 </html>

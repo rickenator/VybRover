@@ -53,7 +53,10 @@ ws_conn_empty()<WsConn> -> {
     return WsConn { ws = WsSocket { fd = -1, host = "", port = 0, path = "" }, pending = "" }
 }
 
-// Attach to `session_id`, forking when `fork` is true.
+// Attach to a conversation. Exactly one of three modes:
+//   `fork` true      -> resume `session_id`, then branch it (continue a discussion)
+//   `new_chat` true  -> `session.create`: a fresh conversation, `session_id` ignored
+//   neither          -> resume `session_id` as-is
 //
 // Returns 0 on success, 1 when no channel could be created, 2 when the attach
 // was refused. On 2 the refusal text is left queued on the slot's channel, so
@@ -61,11 +64,12 @@ ws_conn_empty()<WsConn> -> {
 // SESSION_NOT_OWNED message, for instance) rather than a generic failure.
 share(all)
 session_attach(s<our<Session>>, base_host<String>, base_port<Int>, token<String>,
-               session_id<String>, fork<Bool>)<Int> -> {
+               session_id<String>, fork<Bool>, new_chat<Bool>, cwd<String>)<Int> -> {
     ch<Int> = strchan_new() else -1
     if (ch < 0) { return 1 }
 
-    got<Writer> = writer_attach(base_host, base_port, token, session_id, fork, ch) else zero_writer(ch)
+    got<Writer> = writer_attach(base_host, base_port, token, session_id, fork,
+                                new_chat, cwd, ch) else zero_writer(ch)
     if (!got.open) {
         // Record the channel so the refusal message can be drained from it.
         mutex_lock(s.lock)
@@ -151,6 +155,7 @@ drain_json(ch<Int>)<String> -> {
         if (ev.starts_with("start:")) { kind = "start"; text = "" }
         if (ev.starts_with("attached:")) { kind = "attached"; text = ev.substring(9, ev.len()) }
         if (ev.starts_with("branch:")) { kind = "branch"; text = ev.substring(7, ev.len()) }
+        if (ev.starts_with("new:")) { kind = "new"; text = ev.substring(4, ev.len()) }
         if (!first) { out = out.concat(",") }
         out = out.concat("{\"kind\":\"" + kind + "\",\"text\":\"" + json_escape_text(text) + "\"}")
         first = false

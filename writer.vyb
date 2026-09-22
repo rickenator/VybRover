@@ -146,13 +146,54 @@ struct Writer {
 // Returns the live writer, or absent when the handshake or the attach failed.
 // Hermes' own refusal text (4090/SESSION_NOT_OWNED) is pushed onto the channel
 // verbatim as `error:<message>`, never replaced with friendlier wording.
+//
+// `new` true -> start a FRESH conversation with `session.create` (no resume, no
+//   parent). `stored_id` is ignored; it is passed as the new session's title, so
+//   an empty one is fine.
 share(all)
 writer_attach(base_host<String>, base_port<Int>, token<String>, stored_id<String>,
-              fork<Bool>, events<Int>)<Writer?> -> {
+              fork<Bool>, new_chat<Bool>, cwd<String>, events<Int>)<Writer?> -> {
     path<String> = "/api/ws?token=" + token
     conn<WsConn> = ws_connect(base_host, base_port, path, 20000) else WsConn {
         ws = ws_reset_socket(), pending = "" }
     if (conn.ws.fd < 0) { return Writer?() }
+
+    // Step 0 (new chat): create a session outright. There is no parent to resume
+    // and nothing to branch, so this is the whole attach -- and the reply already
+    // carries `session_id` (runtime id) and `stored_session_id`, so no scraping
+    // of a large transcript is needed.
+    if (new_chat) {
+        // `cwd` matters: Hermes otherwise picks its own default, and a session
+        // whose cwd is not this project shows the wrong context. `title` keeps
+        // the list readable -- the session appears in the left rail like any other.
+        create_params<String> = "{\"title\":\"New discussion\",\"cwd\":\"" +
+                                json_escape_text(cwd) + "\"}"
+        sent0<Bool> = ws_send_text(conn.ws, rpc("session.create", create_params, 3)) else false
+        if (!sent0) {
+            ws_close(conn.ws, 1000, "create failed")
+            return Writer?()
+        }
+        reply0<String> = await_rpc_reply(conn, 3, conn.pending, 400) else ""
+        if (reply0.len() == 0) {
+            strchan_send(events, "error:no reply to session.create")
+            ws_close(conn.ws, 1000, "create failed")
+            return Writer?()
+        }
+        if (reply0.index_of("\"error\"") >= 0) {
+            strchan_send(events, "error:" + error_message(reply0))
+            ws_close(conn.ws, 1000, "create refused")
+            return Writer?()
+        }
+        // `last` because a create reply's payload can itself mention ids.
+        child<String> = json_string_field_last(reply0, "stored_session_id")
+        child_live<String> = json_string_field_last(reply0, "session_id")
+        if (child.len() == 0) { child = stored_id }
+        if (child_live.len() == 0) { child_live = child }
+        w<Writer> = Writer { conn = conn, stored_id = child, live_id = child_live,
+                             events = events, open = true }
+        strchan_send(events, "new:" + child)
+        return Writer?(w)
+    }
 
     // Step 1: resume the stored session so it is loaded on this connection.
     //
