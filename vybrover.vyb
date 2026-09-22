@@ -31,6 +31,10 @@ import url::{str_to_int}
 import network::{socket_open, socket_connect, socket_close, socket_send,
                 socket_recv, socket_set_timeout, Socket}
 import time::{sleep_ms}
+import threads::{thread_spawn, thread_detach}
+import writer::{json_escape_text}
+import session::{Session, session_empty, session_attach, session_send,
+                session_drain, session_detach, session_stored_id, session_is_live}
 
 // --- aspect: shared surface for the values this reader emits -----------------
 // Bind bodies let the same declared method name resolve for each concrete type,
@@ -90,7 +94,7 @@ json_escape(s<String>)<String> -> {
 // Locate a request header value case-insensitively; absent when not present.
 // Header names in HTTP/1.1 are case-insensitive, so a naive index_of would miss
 // a client that sends `x-hermes-session-token` in lowercase.
-header_value(head<String>, name<String>)<String?> -> {
+request_header(head<String>, name<String>)<String?> -> {
     return scan_lines(head.split("\r\n"), name.to_lower(), 1)
 }
 
@@ -160,22 +164,145 @@ err_json(msg<String>)<String> -> {
     return "{\"error\":\"" + json_escape(msg) + "\"}"
 }
 
+// A field's string value out of a JSON request body, or "" when absent.
+// Tolerant of the spacing a JS client emits (`JSON.stringify` writes `"k": "v"`
+// with a space), and the tight form for other clients.
+json_field(body<String>, key<String>)<String> -> {
+    spaced<String> = "\"" + key + "\": \""
+    tight<String> = "\"" + key + "\":\""
+    start<Int> = field_start(body, spaced)
+    if (start < 0) { start = field_start(body, tight) }
+    if (start < 0) { return "" }
+    return field_value(body, start)
+}
+
+field_start(body<String>, needle<String>)<Int> -> {
+    pos<Int> = body.index_of(needle)
+    if (pos < 0) { return -1 }
+    return pos + needle.len()
+}
+
+// Read to the closing quote, keeping backslash escapes intact (a composer's
+// message may legitimately contain a quote or a newline).
+field_value(body<String>, i<Int>)<String> -> {
+    out<String> = ""
+    while (i < body.len()) {
+        c<String> = body.substring(i, i + 1)
+        if (c == "\"") { return out }
+        if (c == "\\") {
+            if (i + 1 < body.len()) {
+                out = out.concat(c)
+                out = out.concat(body.substring(i + 1, i + 2))
+                i = i + 2
+            } else {
+                out = out.concat(c)
+                i = i + 1
+            }
+        } else {
+            out = out.concat(c)
+            i = i + 1
+        }
+    }
+    return out
+}
+
 // --- server ------------------------------------------------------------------
 
 // Route one request. Returns the full response text.
-handle(head<String>, static_dir<String>, token<String>, base_host<String>, base_port<Int>)<String> -> {
+//
+// `sess` is a `their<Session>` borrow: the writer slot must survive across
+// requests and be mutated in place by /api/attach, /api/send and /api/detach. A
+// plain by-value parameter would be a copy, so every mutation would be lost. 
+handle(head<String>, body<String>, method<String>, sess<our<Session>>,
+       static_dir<String>, token<String>, base_host<String>, base_port<Int>)<String> -> {
     path<String> = http_request_path(head)
     if (path.len() == 0) { path = "/" }
+    // Routes are matched on the PATH only; a query string (or the bare "?" a
+    // JS client emits for an empty query object) must not change the route.
+    // Without this, `/api/events?` matches no route and falls through to the
+    // Hermes proxy, which answers "No such API endpoint" with a 200 -- a page
+    // polling it then silently sees a non-array forever.
+    qm<Int> = path.index_of("?")
+    if (qm >= 0) { path = path.substring(0, qm) }
 
     match (path) {
         "/" -> { return serve_file(static_dir + "/index.html", "text/html; charset=utf-8") }
         "/index.html" -> { return serve_file(static_dir + "/index.html", "text/html; charset=utf-8") }
         "/healthz" -> { return respond(200, "application/json", "{\"ok\":true}") }
+        "/api/attach" -> { return do_attach(sess, body, false, token, base_host, base_port) }
+        "/api/fork" -> { return do_attach(sess, body, true, token, base_host, base_port) }
+        "/api/send" -> { return do_send(sess, body, 1000) }
+        "/api/events" -> { return respond(200, "application/json", session_drain(sess)) }
+        "/api/state" -> {
+            // The slot's own truth, so the page can recover after a reload
+            // instead of assuming "not attached" when a writer is actually live.
+            live<Bool> = session_is_live(sess)
+            sid<String> = session_stored_id(sess)
+            // No ternary in Vyb: pick the literal with an if.
+            flag<String> = "false"
+            if (live) { flag = "true" }
+            return respond(200, "application/json",
+                "{\"live\":" + flag + ",\"stored_id\":\"" + json_escape_text(sid) + "\"}")
+        }
+        "/api/detach" -> { session_detach(sess); return respond(200, "application/json", "{\"ok\":true}") }
         ? -> { return match (path.starts_with("/api/")) {
             true -> relay(hermes_fetch_with_token(base_host, base_port, path, token))
             false -> respond(404, "application/json", "{\"error\":\"not found\"}")
         } }
     }
+}
+
+// POST /api/attach or /api/fork. Body: {"session_id": "..."}.
+//
+// On failure the response carries Hermes' own refusal text (a 4090
+// SESSION_NOT_OWNED message, for instance) under an `error` key, so the browser
+// shows why the attach was refused instead of a generic failure.
+do_attach(sess<our<Session>>, body<String>, fork<Bool>, token<String>,
+          base_host<String>, base_port<Int>)<String> -> {
+    sid<String> = json_field(body, "session_id")
+    if (sid.len() == 0) {
+        return respond(400, "application/json", err_json("missing session_id"))
+    }
+    // One writer at a time: release any previous slot before attaching, or the
+    // old lease would keep the first conversation pinned.
+    if (sess.live) { session_detach(sess) }
+
+    // session_attach returns a status: 0 attached, 1 no channel, 2 refused.
+    code<Int> = session_attach(sess, base_host, base_port, token, sid, fork)
+    if (code != 0) {
+        // The refusal text is queued on the slot's channel; relay it so Hermes'
+        // own wording (4090 SESSION_NOT_OWNED and friends) reaches the browser.
+        reason<String> = session_drain(sess)
+        return respond(502, "application/json",
+                       "{\"error\":\"attach refused\",\"events\":" + reason + "}")
+    }
+    return respond(200, "application/json",
+                   "{\"ok\":true,\"stored_id\":\"" + session_stored_id(sess) + "\"}")
+}
+
+// POST /api/send. Body: {"text": "..."}.
+//
+// `seq` is the JSON-RPC id for this submit. The caller owns it (a request-scoped
+// counter) because Vyb has no module-level mutable state to hang one on.
+do_send(sess<our<Session>>, body<String>, seq<Int>)<String> -> {
+    text<String> = json_field(body, "text")
+    if (text.len() == 0) {
+        return respond(400, "application/json", err_json("empty text"))
+    }
+    if (!sess.live) {
+        return respond(409, "application/json", err_json("no session attached"))
+    }
+    ok<Bool> = session_send(sess, text, seq)
+    if (!ok) {
+        return respond(502, "application/json", err_json("prompt.submit refused"))
+    }
+    return respond(200, "application/json", "{\"ok\":true}")
+}
+
+// A refusal hint that never leaks the token: the browser already has whatever
+// the server said in the event stream.
+token_redacted_hint()<String> -> {
+    return "check the event stream for Hermes' message"
 }
 
 // Relay an upstream response. We send the body verbatim under our own 200/502 so
@@ -261,6 +388,76 @@ socket_read_all(fd<Int>)<String> -> {
     return acc
 }
 
+// The request method from a head's request line ("POST /api/send HTTP/1.1").
+// Returns "" when the line is malformed.
+request_method(head<String>)<String> -> {
+    stop<Int> = head.index_of(" ")
+    if (stop <= 0) { return "" }
+    return head.substring(0, stop)
+}
+
+// The Content-Length value, or 0 when absent/unparseable. Absent on a GET, which
+// is why 0 is the right default rather than an error.
+content_length(head<String>)<Int> -> {
+    match (request_header(head, "content-length")) {
+        v -> { return str_to_int(v) }
+        ? -> { return 0 }
+    }
+}
+
+// Read a request head, keeping whatever body bytes arrived alongside it.
+//
+// WHY NOT `http::http_read_head`: that helper returns only the head
+// (`buf.substring(0, idx + 4)`) and DISCARDS the rest of the chunk it just read.
+// A POST body frequently lands in the same TCP segment -- and when it does, the
+// discarded bytes are gone, so a later `read_body` waits forever for data the
+// socket will never resend. The hang is silent: no error, no response.
+//
+// Returns the head plus any body bytes already read, so a caller can decide
+// where the boundary is.
+head_with_overflow(fd<Int>, max<Int>)<String> -> {
+    buf<String> = ""
+    marker<String> = "\r\n\r\n"
+    while (buf.len() < max) {
+        chunk<String> = socket_recv(fd, 256) else ""
+        if (chunk.len() == 0) { break }
+        buf = buf.concat(chunk)
+        if (buf.index_of(marker) >= 0) { return buf }
+    }
+    return buf
+}
+
+// The head's own length, i.e. everything through the terminating CRLFCRLF.
+head_len(head<String>)<Int> -> {
+    stop<Int> = head.index_of("\r\n\r\n")
+    if (stop < 0) { return head.len() }
+    return stop + 4
+}
+
+// Leftover bytes past the head: the start of the body, when it co-arrived.
+head_overflow(head<String>)<String> -> {
+    cut<Int> = head_len(head)
+    if (head.len() <= cut) { return "" }
+    return head.substring(cut, head.len())
+}
+
+// Read a request body of `n` bytes: whatever came with the head first, then the
+// socket. Never past `n`, so a pipelined request stays intact.
+read_body(fd<Int>, n<Int>, already<String>)<String> -> {
+    if (n <= 0) { return "" }
+    acc<String> = already
+    if (acc.len() > n) { return acc.substring(0, n) }
+    guard<Int> = 0
+    while (acc.len() < n && guard < 64) {
+        chunk<String> = socket_recv(fd, 8192) else ""
+        if (chunk.len() == 0) { break }
+        acc = acc.concat(chunk)
+        guard = guard + 1
+    }
+    if (acc.len() > n) { return acc.substring(0, n) }
+    return acc
+}
+
 main()<Int> -> {
     static_dir<String> = env_get("VYBROVER_STATIC_DIR") else "."
     token<String> = env_get("HERMES_TRANSCRIPT_TOKEN") else ""
@@ -270,25 +467,28 @@ main()<Int> -> {
     port_s<String> = env_get("VYBROVER_PORT") else "9210"
     port<Int> = str_to_int(port_s)
 
+    // The writer slot outlives every request. Held here, passed to `handle` as a
+    // `their<>` borrow so an attach/send mutates this one.
+    sess<our<Session>> = session_empty()
+
     match (http_listen(port, 32)) {
         listener -> {
             bound<Int> = http_local_port(listener)
             if (bound <= 0) { return 2 }
-            println("Hermes Transcript (vybey) -> http://127.0.0.1:")
+            println("VybRover (vybey) -> http://127.0.0.1:")
             println(bound)
 
-            // Accept loop: one connection at a time is plenty for a reading
-            // surface, and keeps this honest about what it does NOT do
-            // (no thread pool, no keep-alive, no TLS -- put it behind loopback).
+            // Accept loop. Each connection is dispatched to a detached worker
+            // because a writer session's /api/events poll and the transcript's
+            // /api/sessions fetch must not queue behind each other: the streaming
+            // thread pushes deltas continuously, and a serialized accept loop
+            // would make the page feel stalled during a turn.
             while (true) {
                 match (http_accept(listener)) {
                     conn -> {
                         // http_* take a raw fd, not the TcpStream wrapper.
-                        fd<Int> = conn.fd
-                        head<String> = http_read_head(fd, 65536)
-                        resp<String> = handle(head, static_dir, token, base_host, base_port)
-                        http_send_all(fd, resp)
-                        http_close(fd)
+                        served<Int> = serve_conn(conn.fd, sess, static_dir, token,
+                                                 base_host, base_port) else -1
                     }
                     ? -> { sleep_ms(5) }
                 }
@@ -300,4 +500,25 @@ main()<Int> -> {
             return 1
         }
     }
+}
+
+// Serve one accepted connection and close it. The `their<Session>` borrow is
+// forwarded so the worker mutates the shared writer slot directly.
+serve_conn(fd<Int>, sess<our<Session>>, static_dir<String>, token<String>,
+           base_host<String>, base_port<Int>)<Int?> -> {
+    h<Int> = thread_spawn(|| -> {
+        // raw<String> carries the head AND any body bytes that co-arrived; the
+        // stdlib helper would drop the latter and hang the body read.
+        raw<String> = head_with_overflow(fd, 65536)
+        head<String> = raw.substring(0, head_len(raw))
+        method<String> = request_method(head)
+        body<String> = read_body(fd, content_length(head), head_overflow(raw))
+        resp<String> = handle(head, body, method, sess, static_dir, token,
+                              base_host, base_port)
+        http_send_all(fd, resp)
+        http_close(fd)
+        return 0
+    }) else -1
+    if (h >= 0) { thread_detach(h) }
+    return Int?(0)
 }

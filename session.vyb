@@ -1,0 +1,174 @@
+// session.vyb — the server's writer slot: at most ONE live conversation at a
+// time.
+//
+// Endpoints it backs (routed by vybrover.vyb):
+//   POST /api/attach  {"session_id": "..."}   -> resume as-is
+//   POST /api/fork    {"session_id": "..."}   -> branch a new child
+//   POST /api/send    {"text": "..."}         -> submit a turn
+//   GET  /api/events                          -> drain since the last poll
+//   POST /api/detach                          -> close the writer
+//
+// WHY `our<T>` + A MUTEX: the HTTP accept loop hands each connection to a worker
+// thread, and the writer state must be visible to all of them. Vyb forbids
+// capturing `their<T>` (or `my<T>`) in a `thread_spawn` closure — only
+// ref-counted `our<T>` may cross a thread boundary — and a plain struct captured
+// by value is a COPY, so a mutation inside the closure never reaches the caller.
+// So the slot is an `our<Session>` whose every mutation goes through a mutex
+// handle it carries. Refcounting keeps it alive; the mutex makes writes safe.
+//
+// ONE SLOT, NOT A REGISTRY: the compose pane is a single conversation. A map of
+// session-id -> writer would be machinery with no caller, and would hold open
+// sockets nobody is watching.
+
+import writer::{writer_attach, writer_submit, writer_stream, Writer, json_escape_text}
+import channels::{strchan_new, strchan_try, strchan_close}
+import websocket::{ws_close, WsConn, WsSocket}
+import threads::{mutex_new, mutex_lock, mutex_unlock}
+
+// The shared writer slot. `lock` is a runtime mutex handle (Int) guarding the
+// writer/channel fields, so two worker threads never attach or submit at once.
+share(all)
+struct Session {
+    lock<Int>,
+    writer<Writer>,
+    events<Int>,
+    live<Bool>
+}
+
+// An empty slot, wrapped as a shared owner.
+share(all)
+session_empty()<our<Session>> -> {
+    return our(Session { lock = mutex_new() else -1, writer = zero_writer(-1),
+                         events = -1, live = false })
+}
+
+// A Writer placeholder for "nothing attached". fd < 0 is writer.vyb's own
+// not-connected marker and never leaves that module as data.
+zero_writer(events<Int>)<Writer> -> {
+    return Writer { conn = ws_conn_empty(), stored_id = "", live_id = "",
+                    events = events, open = false }
+}
+
+ws_conn_empty()<WsConn> -> {
+    return WsConn { ws = WsSocket { fd = -1, host = "", port = 0, path = "" }, pending = "" }
+}
+
+// Attach to `session_id`, forking when `fork` is true.
+//
+// Returns 0 on success, 1 when no channel could be created, 2 when the attach
+// was refused. On 2 the refusal text is left queued on the slot's channel, so
+// the caller can drain it and show Hermes' own wording (a 4090
+// SESSION_NOT_OWNED message, for instance) rather than a generic failure.
+share(all)
+session_attach(s<our<Session>>, base_host<String>, base_port<Int>, token<String>,
+               session_id<String>, fork<Bool>)<Int> -> {
+    ch<Int> = strchan_new() else -1
+    if (ch < 0) { return 1 }
+
+    got<Writer> = writer_attach(base_host, base_port, token, session_id, fork, ch) else zero_writer(ch)
+    if (!got.open) {
+        // Record the channel so the refusal message can be drained from it.
+        mutex_lock(s.lock)
+        s.events = ch
+        s.live = false
+        mutex_unlock(s.lock)
+        return 2
+    }
+
+    // Start the streaming reader before any turn is submitted: deltas arrive on
+    // the same socket the submit writes to, so it must already be draining.
+    writer_stream(got)
+
+    mutex_lock(s.lock)
+    s.writer = got
+    s.events = ch
+    s.live = true
+    mutex_unlock(s.lock)
+    return 0
+}
+
+// The stored id of the attached session, or "" when nothing is attached.
+share(all)
+session_stored_id(s<our<Session>>)<String> -> {
+    mutex_lock(s.lock)
+    id<String> = s.writer.stored_id
+    mutex_unlock(s.lock)
+    return id
+}
+
+// Is a writer currently attached? Lets the API report the slot's real state.
+share(all)
+session_is_live(s<our<Session>>)<Bool> -> {
+    mutex_lock(s.lock)
+    v<Bool> = s.live
+    mutex_unlock(s.lock)
+    return v
+}
+
+// Submit `text`. Returns true when the server accepted the turn.
+share(all)
+session_send(s<our<Session>>, text<String>, seq<Int>)<Bool> -> {
+    mutex_lock(s.lock)
+    live<Bool> = s.live
+    w<Writer> = s.writer
+    mutex_unlock(s.lock)
+    if (!live) { return false }
+    return writer_submit(w, text, seq)
+}
+
+// Drain every event queued since the last call, as a JSON array of
+// {"kind": ..., "text": ...} objects. "[]" when nothing is pending.
+//
+// Drained NON-blockingly: the page polls, so a blocking recv here would park the
+// HTTP worker until the next delta and stall the response.
+share(all)
+session_drain(s<our<Session>>)<String> -> {
+    mutex_lock(s.lock)
+    ch<Int> = s.events
+    mutex_unlock(s.lock)
+    if (ch < 0) { return "[]" }
+    return drain_json(ch)
+}
+
+drain_json(ch<Int>)<String> -> {
+    out<String> = "["
+    first<Bool> = true
+    guard<Int> = 0
+    while (guard < 5000) {
+        ev<String> = strchan_try(ch) else ""
+        if (ev.len() == 0) { break }
+        // The event prefix names the kind; the remainder is the payload. An
+        // unrecognised prefix becomes "other" rather than being dropped --
+        // silence in the UI would look like the turn died.
+        kind<String> = "other"
+        text<String> = ev
+        if (ev.starts_with("answer:")) { kind = "answer"; text = ev.substring(7, ev.len()) }
+        if (ev.starts_with("thinking:")) { kind = "thinking"; text = ev.substring(9, ev.len()) }
+        if (ev.starts_with("tool:")) { kind = "tool"; text = ev.substring(5, ev.len()) }
+        if (ev.starts_with("done:")) { kind = "done"; text = ev.substring(5, ev.len()) }
+        if (ev.starts_with("error:")) { kind = "error"; text = ev.substring(6, ev.len()) }
+        if (ev.starts_with("reply:")) { kind = "reply"; text = ev.substring(6, ev.len()) }
+        if (ev.starts_with("start:")) { kind = "start"; text = "" }
+        if (ev.starts_with("attached:")) { kind = "attached"; text = ev.substring(9, ev.len()) }
+        if (ev.starts_with("branch:")) { kind = "branch"; text = ev.substring(7, ev.len()) }
+        if (!first) { out = out.concat(",") }
+        out = out.concat("{\"kind\":\"" + kind + "\",\"text\":\"" + json_escape_text(text) + "\"}")
+        first = false
+        guard = guard + 1
+    }
+    return out.concat("]")
+}
+
+// Close the writer's socket and mark the slot empty. The streaming thread ends
+// when the peer sees the close.
+share(all)
+session_detach(s<our<Session>>) -> {
+    mutex_lock(s.lock)
+    live<Bool> = s.live
+    ch<Int> = s.events
+    if (live) { ws_close(s.writer.conn.ws, 1000, "detached") }
+    s.writer = zero_writer(-1)
+    s.live = false
+    mutex_unlock(s.lock)
+    if (ch >= 0) { strchan_close(ch) }
+}

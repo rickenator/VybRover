@@ -186,6 +186,66 @@
     background:color-mix(in srgb,#fb2c36 12%,#041c1c); font-size:14px;
   }
   .spin{color:var(--text-secondary); font-size:14px; padding:24px}
+
+  /* --- the writer pane ---------------------------------------------------- */
+  .write{
+    width:360px; flex:0 0 360px; display:flex; flex-direction:column; min-height:0;
+    border-left:1px solid var(--border); background:var(--card);
+  }
+  .write-head{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:12px 14px; border-bottom:1px solid var(--border);
+  }
+  .write-title{font-weight:600; font-size:14px; letter-spacing:.02em}
+  .write-status{
+    font-size:12px; color:var(--text-secondary); font-family:var(--font-mono);
+    padding:2px 8px; border:1px solid var(--border); border-radius:99px; white-space:nowrap;
+  }
+  .write-status.live{
+    color:var(--success); border-color:color-mix(in srgb,#4ade80 45%,transparent);
+  }
+  .write-actions{padding:12px 14px 0}
+  .btn.primary{
+    background:color-mix(in srgb,#ffe6cb 90%,#041c1c); color:#041c1c;
+    border-color:transparent; font-weight:600;
+  }
+  .btn.primary:disabled{opacity:.45; cursor:not-allowed}
+  .write-actions .btn{width:100%; padding:9px 10px}
+
+  .write-log{
+    flex:1; min-height:0; overflow-y:auto; padding:12px 14px;
+    display:flex; flex-direction:column; gap:9px;
+  }
+  .write-empty{color:var(--text-secondary); font-size:13px; line-height:1.5}
+  .msg{padding:8px 11px; border-radius:var(--radius); font-size:13.5px;
+       line-height:1.5; white-space:pre-wrap; word-break:break-word}
+  .msg.me{background:color-mix(in srgb,#ffe6cb 11%,#041c1c); border:1px solid var(--border)}
+  .msg.bot{background:color-mix(in srgb,#4ade80 8%,#041c1c);
+           border:1px solid color-mix(in srgb,#4ade80 30%,transparent)}
+  .msg.think{background:transparent; border:1px dashed var(--border);
+             color:var(--text-secondary); font-style:italic; font-size:12.5px}
+  .msg.tool{background:color-mix(in srgb,#ffbd38 9%,#041c1c);
+            border:1px solid color-mix(in srgb,#ffbd38 32%,transparent);
+            font-family:var(--font-mono); font-size:12px}
+  .msg.err{background:color-mix(in srgb,#fb2c36 12%,#041c1c);
+           border:1px solid color-mix(in srgb,#fb2c36 45%,transparent)}
+  .msg.note{background:transparent; border:1px solid var(--border);
+            color:var(--text-secondary); font-size:12.5px}
+  .role{display:block; font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+        color:var(--text-secondary); margin-bottom:3px}
+
+  .write-form{border-top:1px solid var(--border); padding:12px 14px 14px}
+  .write-text{
+    width:100%; resize:vertical; min-height:64px; padding:9px 11px;
+    background:var(--background); color:var(--midground);
+    border:1px solid var(--border); border-radius:var(--radius);
+    font:13.5px/1.5 var(--font-sans);
+  }
+  .write-text:focus{outline:none; border-color:color-mix(in srgb,#ffe6cb 40%,transparent)}
+  .write-text:disabled{opacity:.5}
+  .write-form-row{display:flex; align-items:center; justify-content:space-between;
+                  gap:10px; margin-top:9px}
+  .hint{font-size:12px; color:var(--text-secondary)}
 </style>
 </head>
 <body>
@@ -226,6 +286,30 @@
       <button id="toTop" class="btn float" title="Jump to oldest message (t)">⤒ Top</button>
     </div>
   </main>
+
+  <aside class="write" id="write">
+    <div class="write-head">
+      <div class="write-title">Continue</div>
+      <span id="writeStatus" class="write-status">not attached</span>
+    </div>
+
+    <div class="write-actions">
+      <button id="btnFork" class="btn primary" title="Branch this discussion into a new session and write there (the original is untouched)">⑂ Continue this discussion</button>
+    </div>
+
+    <div class="write-log" id="writeLog">
+      <div class="write-empty">Open a session, then continue it here.<br>
+        Continuing forks the discussion into a new session, so the original stays as it was.</div>
+    </div>
+
+    <form class="write-form" id="writeForm">
+      <textarea id="writeText" class="write-text" rows="3" placeholder="Write a reply… (Enter to send, Shift+Enter for a newline)"></textarea>
+      <div class="write-form-row">
+        <span id="writeHint" class="hint"></span>
+        <button type="submit" id="btnSend" class="btn primary" disabled>Send</button>
+      </div>
+    </form>
+  </aside>
 </div>
 <script>
 const $ = s => document.querySelector(s);
@@ -475,6 +559,157 @@ document.addEventListener('keydown',e=>{
 
 loadSessions().catch(e=>{
   $('#list').innerHTML = `<div class="spin">Could not load sessions:<br>${esc(e.message)}</div>`;
+});
+recoverWriter();
+
+/* ---- the writer: continue a discussion ------------------------------------
+   All writing goes through VybRover's own endpoints, which hold ONE live
+   WebSocket to Hermes. Resuming a session the TUI still owns is refused
+   (4090 SESSION_NOT_OWNED), so the session is forked first: `session.branch`
+   gives the child its own lease and leaves the parent untouched. That is why
+   the button says "continue this discussion" and not "reopen": the original is
+   a read-only artifact, and the conversation carries on in a new session.
+--------------------------------------------------------------------------- */
+let attached = null;      // the stored id of the forked session under our lease
+let polling = false;      // is the /api/events poll loop running
+let pending = null;       // the assistant bubble being streamed into
+
+function logMsg(cls, role, text){
+  const log = $('#writeLog');
+  $('#writeLog .write-empty')?.remove();
+  const el = document.createElement('div');
+  el.className = `msg ${cls}`;
+  if(role) el.innerHTML = `<span class="role">${esc(role)}</span>`;
+  el.appendChild(document.createTextNode(text));
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function setStatus(text, live){
+  const el = $('#writeStatus');
+  el.textContent = text;
+  el.classList.toggle('live', !!live);
+  $('#btnSend').disabled = !live;
+  $('#writeText').disabled = !live;
+  $('#writeHint').textContent = live ? '' : 'continue this discussion first';
+}
+
+async function post(path, body){
+  const r = await fetch(path, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body || {})
+  });
+  return r.json().catch(()=>({error:`HTTP ${r.status}`}));
+}
+
+/* Continue the currently-open discussion in a new session. */
+async function continueSession(){
+  if(!current){ $('#writeHint').textContent = 'open a session first'; return; }
+  $('#btnFork').disabled = true;
+  $('#writeHint').textContent = 'forking…';
+  try {
+    const j = await post('/api/fork', {session_id: current});
+    if(j.error){
+      // Hermes' own refusal text is the useful part; relay it verbatim.
+      const why = (j.events||[]).map(e=>e.text).filter(Boolean).join(' ') || j.error;
+      logMsg('err', 'error', why);
+      $('#writeHint').textContent = 'fork refused';
+      return;
+    }
+    attached = j.stored_id;
+    setStatus(`live · ${shortId(attached)}`, true);
+    logMsg('note', null, `Continued in a new session (${attached}). The original is unchanged.`);
+    if(!polling) pollEvents();
+  } finally {
+    $('#btnFork').disabled = false;
+  }
+}
+
+/* Drain VybRover's event buffer and paint the streamed turn. */
+async function pollEvents(){
+  polling = true;
+  while(attached){
+    let evs = null;
+    try {
+      // Called directly, not via `api()`: that helper appends "?" for an empty
+      // query object, and a query string must not be needed to hit this route.
+      const r = await fetch('/api/events');
+      if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      evs = await r.json();
+    } catch(e){
+      // Say so once rather than retrying invisibly forever -- a silent loop
+      // looks identical to "the model is thinking".
+      if(!pollEvents.warned){
+        pollEvents.warned = true;
+        logMsg('err', 'poll failed', `Could not reach /api/events: ${e.message}`);
+      }
+      await new Promise(r=>setTimeout(r, 1500));
+      continue;
+    }
+    pollEvents.warned = false;
+    if(Array.isArray(evs)){
+      for(const ev of evs){
+        if(ev.kind === 'answer'){
+          // The visible answer: stream into one growing bubble.
+          if(!pending) pending = logMsg('bot', 'Hermes', '');
+          pending.appendChild(document.createTextNode(ev.text));
+          const log = $('#writeLog');
+          log.scrollTop = log.scrollHeight;
+        } else if(ev.kind === 'thinking'){
+          if(ev.text) logMsg('think', 'thinking', ev.text);
+        } else if(ev.kind === 'tool'){
+          logMsg('tool', 'tool', ev.text);
+        } else if(ev.kind === 'done'){
+          if(pending && ev.text && !pending.textContent.includes(ev.text)){
+            pending.textContent = ev.text;   // authoritative final answer
+            pending.insertAdjacentHTML('afterbegin', '<span class="role">Hermes</span>');
+          }
+          pending = null;
+        } else if(ev.kind === 'error'){
+          logMsg('err', 'error', ev.text);
+          pending = null;
+        }
+      }
+    }
+    await new Promise(r=>setTimeout(r, 900));
+  }
+}
+
+/* Submit a turn. */
+async function sendTurn(){
+  const box = $('#writeText');
+  const text = box.value.trim();
+  if(!text || !attached) return;
+  logMsg('me', 'You', text);
+  box.value = '';
+  const j = await post('/api/send', {text});
+  if(j.error) logMsg('err', 'error', j.error);
+}
+
+/* Recover the writer state after a reload.
+   The server holds ONE slot that outlives the page, so a reload must ask it
+   what is attached rather than assume nothing is. Otherwise a refresh during a
+   live conversation shows "not attached" while the server still holds the
+   session, and the next Send fails with "no session attached". */
+async function recoverWriter(){
+  try {
+    const r = await fetch('/api/state');
+    const j = await r.json();
+    if(j && j.live && j.stored_id){
+      attached = j.stored_id;
+      setStatus(`live · ${shortId(attached)}`, true);
+      logMsg('note', null, `Reattached to the live session (${attached}).`);
+      if(!polling) pollEvents();
+    }
+  } catch(e){ /* no writer yet: leave the pane in its empty state */ }
+}
+
+$('#btnFork').addEventListener('click', continueSession);
+$('#writeForm').addEventListener('submit', e=>{ e.preventDefault(); sendTurn(); });
+$('#writeText').addEventListener('keydown', e=>{
+  // Enter sends; Shift+Enter is a newline. The usual composer convention.
+  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendTurn(); }
 });
 </script>
 </body>
